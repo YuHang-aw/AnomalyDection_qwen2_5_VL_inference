@@ -1,146 +1,114 @@
 # ===================================================================
-# Qwen-VL 衬砌板异常检测 - 综合实验配置文件 v2.0
-# ===================================================================
-# ===================================================================
-# Qwen-VL 衬砌板异常检测 - 综合实验配置文件 v3.0
+# Qwen-VL 衬砌板异常检测 - 综合实验配置文件 v3.1
 # ===================================================================
 
 # -----------------------------------
 # 0. 执行模式控制
 # -----------------------------------
 execution:
-  # "integrated": 脚本直接加载模型，适合快速调试。
-  # "api_client": 脚本作为客户端请求一个独立的API服务，适合生产和大规模批处理。
+  # "integrated": 直接在本进程加载模型（快速调试）
+  # "api_client": 走 OpenAI 兼容 API（生产/并发/常驻）
   mode: "integrated"
 
-  # 仅在 mode 为 "api_client" 时生效
+  # 仅 api_client 时生效
   api_client_settings:
-    # Llama-factory API服务的地址
     base_url: "http://localhost:8000/v1"
-    # Llama-factory API服务使用的模型名称 (通常在启动服务的yaml中定义)
     model_name: "qwen"
-    # API Key (对于本地服务，可以是任意非空字符串)
     api_key: "sk-anything"
+    # 新增：健壮性
+    request_timeout_s: 120          # 单次请求超时（秒）
+    max_retries: 3                  # 失败重试次数
+    temperature: 0.1
+    max_tokens: 2048
+
 # -----------------------------------
-# 1. 模型与加载设置
+# 1. 模型与加载设置（仅 integrated 使用）
 # -----------------------------------
 model:
-  # Llama-factory兼容的模型路径或HuggingFace Hub名称
-  # 例如: "Qwen/Qwen2.5-VL-Max-Chat", "/path/to/your/local/model"
-  path: "Qwen/Qwen2.5-VL-Max-Chat" 
+  # 模型路径或 Hub 名称
+  path: "Qwen/Qwen2.5-VL-Max-Chat"
 
-  # Llama-factory 模型加载高级参数 (会直接传递给 ChatModel)
+  # 传给 ChatModel 的参数（已在 run_inference 内做白名单过滤）
   loading_args:
-    # 模板，对于Qwen系列通常是 "qwen"
-    template: "qwen"
-    # 是否使用 Flash Attention 加速，可选 "auto", true, false
+    template: "qwen2_vl"            # Qwen 2/2.5-VL 常用模板
+    device_map: "auto"
+    trust_remote_code: true
+    # 性能/量化（按需）
     flash_attn: "auto"
-    # 量化等级，例如 4 或 8。设为 null 表示不量化。
-    quantization_bit: 4 
-    # 如果使用了LoRA等微调，在此处指定适配器路径
-    adapter_path: null
+    quantization_bit: 4
+    # 可选：LoRA/Adapter
+    adapter_name_or_path: null
+    # 可选：推理后端（环境支持时生效）
+    infer_backend: "hf"
 
 # -----------------------------------
 # 2. 数据与输出设置
 # -----------------------------------
 data:
-  # 数据集根目录，必须包含'p'(正样本/异常)和'n'(负样本/正常)两个子目录
   data_dir: "./my_tunnel_data/"
-  # 存放结果和临时文件的目录
   output_dir: "./results/"
-  # 结果文件名。设为 "auto" 将根据实验配置自动生成，例如 "full_image-few_shot-bbox.json"
-  # 也可以指定一个固定名称，例如 "my_test_run.json"
   results_filename: "auto"
-  # 限制处理的样本数量（每个类别）。用于快速调试。
-  # 设为 0 或 null 表示处理所有样本。
   limit_samples_per_category: 0
 
 # -----------------------------------
 # 3. 推理任务控制
 # -----------------------------------
 inference:
-  # 推理模式: 
-  # "full_image": 直接处理整张大图。
-  # "sliced_image": 将大图切割成小块后，逐块推理。
-  mode: "full_image"
-
-  # --- 增强功能选项 ---
-  # 是否启用Few-shot推理。
+  mode: "full_image"                # 或 "sliced_image"
   use_fewshot: false
-  # Few-shot示例图片目录 (仅在 use_fewshot 为 true 时需要)
   fewshot_examples_dir: "./few_shot_examples/"
-  
-  # 是否启用BBox引导推理。
-  # 仅在 "full_image" 模式下有效。
-  # 在 "full_image" 模式下, 可与 use_fewshot 同时为 true，实现“学习后聚焦诊断”的强大模式。
-  use_bbox: false
+  use_bbox: false                   # 仅 full_image 有效
 
 # -----------------------------------
-# 4. BBox 设置 (仅当 use_bbox 为 true 时生效)
+# 4. BBox 设置（仅 use_bbox=true 时）
 # -----------------------------------
 bbox_settings:
-  # BBox来源。当前版本支持 "auto_generate"。
-  # 未来可扩展为 "from_json"，从一个标注文件中读取坐标。
   source: "auto_generate"
-  # 当 source 为 "auto_generate" 时，在图片中心生成一个BBox
-  # BBox边长相对于图片短边的比例。例如 0.5 表示BBox大小为图片的一半。
   relative_size: 0.5
-  # BBox线条颜色
   outline_color: "red"
-  # BBox线条宽度
   outline_width: 5
 
 # -----------------------------------
-# 5. 切割参数 (仅当 mode 为 "sliced_image" 时生效)
+# 5. 切割参数（仅 sliced_image）
 # -----------------------------------
 slicing:
-  # 切割后的小图尺寸 (正方形，单位像素)
   slice_size: 768
-  # 小图之间的重叠像素，以避免丢失边缘信息
   slice_overlap: 128
 
 # -----------------------------------
-# 6. Prompt 模板配置
-# 您可以在这里直接修改Prompt，进行快速的Prompt Engineering实验！
-# <image> 是一个特殊的占位符，程序会自动替换为图片。
+# 6. Prompt 模板配置（不再使用 <image> 或 {image_token}）
 # -----------------------------------
 prompts:
+  system: |
+    你是一个谨慎、严谨的隧道结构安全检测工程师，请给出可复核、可落地的判断与依据。
+
   zero_shot: |
-    你是一位专业的隧道结构安全检测工程师。请仔细检查这张衬砌板图片，判断是否存在任何结构性缺陷或安全隐患，例如裂缝、渗水、破损、剥落或严重污渍。
-    请严格按照以下格式返回你的分析结果：
-    【判断】: <这里只填写 '异常' 或 '正常'>
-    【分析】: <这里详细说明你的判断依据。如果是异常，请描述异常的类型、位置和严重程度。>
+    请严格检查这张衬砌板图片是否存在结构性缺陷（如裂缝、渗水、破损、剥落、异常污染等）。
+    请按以下格式输出：
+    【判断】: 异常/正常
+    【分析】: 说明判断依据；若为异常，请描述类型、位置与严重程度。
 
   bbox: |
-    你是一位专业的隧道结构安全检测工程师。这张衬砌板图片中已经用红色方框标出了需要重点关注的区域。
-    请你聚焦于方框内的内容，判断该区域是否存在异常（如裂缝、渗水、破损等）。
-    请严格按照以下格式返回你的分析结果：
-    【判断】: <这里只填写 '异常' 或 '正常'>
-    【分析】: <这里详细说明方框内区域的情况，并解释你的判断依据。>
+    这张图中已用红框标出重点区域。仅聚焦框内进行判断：
+    【判断】: 异常/正常
+    【分析】: 说明框内的具体情况、判断依据与不确定性。
 
-  # {few_shot_examples} 是一个占位符，程序会自动填入示例部分。
-  # {image_token} 是待分析图片的占位符。
   few_shot_base: |
-    你是一位专业的隧道结构安全检测工程师，需要根据提供的示例来判断新的衬砌板图片是否存在异常。
-
+    下面是若干“学习示例”，请参考其判断口径与解释风格完成新图分析：
     --- 示例开始 ---
-
     {few_shot_examples}
     --- 示例结束 ---
 
-    现在，请根据以上示例，对下面这张新的图片进行分析。
-    请严格按照【判断】和【分析】的格式返回结果。
-    {image_token}
+    现在请对新图进行判断：
+    【判断】: 异常/正常
+    【分析】: 清晰说明理由与位置；保持与示例一致的口径。
 
   few_shot_with_bbox_base: |
-    你是一位专业的隧道结构安全检测工程师，需要根据提供的示例来学习判断标准，然后对新图片中标记的区域进行诊断。
-
+    先学习以下示例的判断标准与表达风格：
     --- 学习示例开始 ---
-
     {few_shot_examples}
     --- 学习示例结束 ---
 
-    现在，请运用你从以上示例中学到的知识，聚焦于下面这张新图片中用红色方框标出的区域，并对其进行分析。
-    请严格按照【判断】和【分析】的格式返回结果。
-    {image_token}
-
+    现在仅聚焦新图中的红框区域，完成诊断：
+    【判断】: 异常/正常
+    【分析】: 解释框内的具体依据、异常类型与位置。
