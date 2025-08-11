@@ -1,146 +1,97 @@
-import argparse
-import os
-import json
-import yaml
-from tqdm import tqdm
+# prompts.py
 
-from inference_core import VLModelInference
-# 导入新的prompt函数
-from prompts import get_zero_shot_prompt, get_few_shot_prompt, get_bbox_prompt, get_few_shot_with_bbox_prompt
-from utils.dataset_loader import load_dataset
-from utils.image_processor import slice_image, add_bbox_to_image
+"""
+Prompt Engineering Module for Qwen-VL Tunnel Lining Anomaly Detection.
 
-def main():
-    # --- 1. 解析参数 (与上一版相同) ---
-    parser = argparse.ArgumentParser(description="使用Qwen-VL对衬砌板进行异常检测")
-    parser.add_argument("--config", type=str, default="config.yaml", help="配置文件的路径。")
-    args = parser.parse_args()
-    try:
-        with open(args.config, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-    except FileNotFoundError:
-        print(f"错误：找不到配置文件 {args.config}。")
-        return
-    
-    flat_config = {}
-    for section, params in config.items():
-        for key, value in params.items():
-            flat_config[f"{section}_{key}"] = value
+This module is responsible for dynamically constructing the final prompts sent to the
+vision-language model. It centralizes all prompt-related logic, allowing for easy
+modification and experimentation with different prompt strategies without changing
+the main execution script.
 
-    for key, value in flat_config.items():
-        arg_name = '--' + key.replace('_', '-')
-        parser.add_argument(arg_name, type=type(value), default=value)
-    
-    args = parser.parse_args()
+Key functionalities:
+- Defines the placeholder for images (`IMAGE_TOKEN`).
+- Builds the text block for few-shot examples.
+- Assembles the final prompt from a template and data.
+"""
 
-    # --- 参数逻辑校验 (更新) ---
-    if args.inference_mode == "sliced_image" and args.inference_use_bbox:
-        # 警告并强制关闭bbox，因为在切片模式下无意义
-        print("警告：在 'sliced_image' 模式下，'use_bbox' 参数无效并将被忽略。")
-        args.inference_use_bbox = False
+from typing import List, Tuple
 
-    # --- 2. 初始化模型和加载数据集 (不变) ---
-    model = VLModelInference(args.model_path)
-    dataset = load_dataset(args.data_data_dir)
-    if not dataset: return
-    os.makedirs(args.data_output_dir, exist_ok=True)
-    results = []
+# This is the special token that the Llama-factory framework uses to mark
+# the position where an image should be inserted in the prompt.
+IMAGE_TOKEN = "<image>"
 
-    # 准备Few-shot示例（如果任何模式需要）
-    few_shot_examples = []
-    if args.inference_use_fewshot:
-        if not args.inference_fewshot_examples_dir:
-            raise ValueError("启用few-shot模式必须提供 'fewshot_examples_dir'")
-        few_shot_examples = load_dataset(args.inference_fewshot_examples_dir)
-        print(f"已加载 {len(few_shot_examples)} 个Few-shot示例。")
 
-    # --- 3. 根据模式执行推理 (逻辑重构) ---
-    if args.inference_mode == "full_image":
-        print("模式: [大图完整推理]")
-        output_file = os.path.join(args.data_output_dir, 'full_image_results.json')
+def build_few_shot_examples_text(example_images: List[Tuple[str, str]]) -> str:
+    """
+    Constructs the multi-example text block for a few-shot prompt.
 
-        for image_path, true_label in tqdm(dataset, desc="处理大图中"):
-            image_to_process = image_path
-            prompt_type = ""
-            
-            # 准备BBox（如果启用）
-            if args.inference_use_bbox:
-                temp_bbox_dir = os.path.join(args.data_output_dir, 'temp_bbox_images')
-                os.makedirs(temp_bbox_dir, exist_ok=True)
-                bbox_image_path = os.path.join(temp_bbox_dir, os.path.basename(image_path))
-                image_to_process = add_bbox_to_image(image_path, bbox_image_path)
+    This function iterates through a list of example images and their labels,
+    creating a formatted string that serves as the "learning" section for the model.
+    The analysis text for "异常" (abnormal) and "正常" (normal) is hardcoded here
+    to ensure consistency in the examples shown to the model.
 
-            # 决定使用哪个Prompt和图片列表
-            if args.inference_use_fewshot and args.inference_use_bbox:
-                prompt = get_few_shot_with_bbox_prompt(few_shot_examples)
-                images_for_prompt = [ex[0] for ex in few_shot_examples] + [image_to_process]
-                prompt_type = "few_shot_with_bbox"
-            elif args.inference_use_bbox:
-                prompt = get_bbox_prompt()
-                images_for_prompt = [image_to_process]
-                prompt_type = "bbox"
-            elif args.inference_use_fewshot:
-                prompt = get_few_shot_prompt(few_shot_examples)
-                images_for_prompt = [ex[0] for ex in few_shot_examples] + [image_to_process]
-                prompt_type = "few_shot"
-            else: # Zero-shot
-                prompt = get_zero_shot_prompt()
-                images_for_prompt = [image_to_process]
-                prompt_type = "zero_shot"
+    Args:
+        example_images: A list of tuples, where each tuple contains:
+                        - str: The file path to the example image (not used here, but part of the data structure).
+                        - str: The label ('p' for positive/abnormal, 'n' for negative/normal).
 
-            response = model.predict(prompt, images_for_prompt)
-            results.append({
-                "image_path": image_path,
-                "true_label": true_label,
-                "model_response": response,
-                "prompt_type": prompt_type
-            })
-
-    elif args.inference_mode == "sliced_image":
-        print("模式: [大图切割后推理]")
-        if args.inference_use_fewshot:
-            print("增强功能: [Few-shot已启用] (注意: 性能开销较大)")
-        output_file = os.path.join(args.data_output_dir, 'sliced_image_results.json')
-        temp_slice_dir = os.path.join(args.data_output_dir, 'temp_sliced_images')
+    Returns:
+        A formatted string containing all few-shot examples, ready to be
+        inserted into a larger prompt template.
+    """
+    examples_text = ""
+    for i, (img_path, label) in enumerate(example_images):
+        # Determine the status string based on the label
+        status = "异常" if label == "p" else "正常"
         
-        for image_path, true_label in tqdm(dataset, desc="处理切割图中"):
-            sliced_paths = slice_image(
-                image_path, args.slicing_slice_size, args.slicing_slice_overlap, temp_slice_dir
-            )
+        # Assemble the text for one example
+        examples_text += f"示例 {i+1} ({status}):\n"
+        examples_text += f"{IMAGE_TOKEN}\n"  # Placeholder for the i-th image
+        if status == "异常":
+            examples_text += "【判断】: 异常\n【分析】: 图片中存在明显的结构性缺陷。\n\n"
+        else:
+            examples_text += "【判断】: 正常\n【分析】: 衬砌板表面完整，无明显缺陷。\n\n"
             
-            abnormal_slice_found = False
-            slice_responses = []
+    return examples_text
 
-            # 为切片准备prompt和图片列表
-            if args.inference_use_fewshot:
-                prompt = get_few_shot_prompt(few_shot_examples)
-                # 示例图片需要为每个切片都传入
-                base_images_for_prompt = [ex[0] for ex in few_shot_examples]
-            else:
-                prompt = get_zero_shot_prompt()
-                base_images_for_prompt = []
 
-            for slice_path in tqdm(sliced_paths, desc=f"推理切片", leave=False):
-                images_for_prompt = base_images_for_prompt + [slice_path]
-                response = model.predict(prompt, images_for_prompt)
-                slice_responses.append({"slice": slice_path, "response": response})
-                if "【判断】: 异常" in response:
-                    abnormal_slice_found = True
-            
-            final_decision = "异常" if abnormal_slice_found else "正常"
-            results.append({
-                "image_path": image_path,
-                "true_label": true_label,
-                "final_decision": final_decision,
-                "prompt_type": "sliced_with_few_shot" if args.inference_use_fewshot else "sliced_zero_shot",
-                "slice_details": slice_responses
-            })
+def get_final_prompt(prompt_template: str, few_shot_examples: List[Tuple[str, str]] = None) -> str:
+    """
+    Dynamically assembles the final prompt from a template and optional few-shot data.
 
-    # --- 4. 保存和清理 (不变) ---
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(results, f, indent=4, ensure_ascii=False)
-    print(f"所有任务完成！结果已保存至: {output_file}")
-    model.cleanup()
+    This is the main function used by the execution script (`run_inference.py`). 
+    It takes a prompt template (read from config.yaml) and fills in the necessary placeholders.
 
-if __name__ == "__main__":
-    main()
+    Args:
+        prompt_template: The raw prompt string from the config file, which may contain 
+                         placeholders like `{few_shot_examples}` and `{image_token}`.
+        few_shot_examples: An optional list of few-shot examples. This is required if the
+                           template contains the `{few_shot_examples}` placeholder.
+
+    Returns:
+        The final, complete prompt string ready to be sent to the model.
+
+    Raises:
+        ValueError: If the template requires few-shot examples but none are provided.
+    """
+    # Check if the template is a few-shot template by looking for the placeholder
+    if "{few_shot_examples}" in prompt_template:
+        if not few_shot_examples:
+            raise ValueError("Prompt模板需要few-shot示例，但未提供 (few_shot_examples is None or empty).")
+        
+        # First, build the text block for all the examples
+        examples_text = build_few_shot_examples_text(few_shot_examples)
+        
+        # Then, insert the examples block and the final image token placeholder
+        # into the main template.
+        prompt = prompt_template.format(
+            few_shot_examples=examples_text, 
+            image_token=IMAGE_TOKEN
+        )
+    else:
+        # For zero-shot or bbox prompts, they typically only need the final image token.
+        # The .format() method will safely ignore extra placeholders if they don't exist.
+        prompt = prompt_template.format(image_token=IMAGE_TOKEN)
+        
+    return prompt
+

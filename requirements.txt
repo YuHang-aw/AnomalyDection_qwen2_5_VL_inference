@@ -12,3 +12,6 @@ opencv-python-headless>=4.8.0
 PyYAML>=6.0
 tqdm>=4.66.0
 numpy>=1.24.0
+
+# API 客户端
+openai>=1.0.0 
