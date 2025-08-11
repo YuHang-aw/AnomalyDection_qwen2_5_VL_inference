@@ -58,6 +58,8 @@ inference:
   use_fewshot: false
   fewshot_examples_dir: "./few_shot_examples/"
   fewshot_limit_per_class: 4
+  fewshot_label_hint: false         # ☆ 关闭 few-shot 文本里的“参考判定：异常/正常”
+  exclude_fewshot_from_eval: true 
   use_bbox: false                   # 仅 full_image 有效
 
 # -----------------------------------
