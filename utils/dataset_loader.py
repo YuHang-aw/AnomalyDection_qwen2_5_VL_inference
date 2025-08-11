@@ -1,23 +1,45 @@
+# -*- coding: utf-8 -*-
 import os
-from glob import glob
+from typing import List, Tuple
 
-def load_dataset(data_dir: str) -> list[tuple[str, str]]:
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+def _is_img(name: str) -> bool:
+    return os.path.splitext(name.lower())[1] in IMAGE_EXTS
+
+def _scan_dir(dir_path: str) -> List[str]:
+    if not os.path.isdir(dir_path):
+        return []
+    files = [os.path.join(dir_path, f) for f in sorted(os.listdir(dir_path)) if _is_img(f)]
+    return files
+
+def load_dataset(data_dir: str, limit_per_class: int | None = None) -> List[Tuple[str, str]]:
     """
-    加载数据集，返回 (图片路径, 标签) 的列表。
-    标签 'p' 代表正样本 (异常), 'n' 代表负样本 (正常)。
+    返回 [(image_path, label)] 列表。
+    - 若 data_dir 下存在 'n' 与 'p' 子目录，则分别作为负/正样本。
+    - 否则将 data_dir 视作平铺目录，label 记为 'unknown'。
+    - limit_per_class: 每类（n/p）最多取多少张；<=0 或 None 表示不限制。
     """
-    if not os.path.isdir(data_dir):
-        raise ValueError(f"数据目录不存在: {data_dir}")
+    if not data_dir or not os.path.isdir(data_dir):
+        print(f"[WARN] 数据目录不存在：{data_dir}")
+        return []
 
-    positive_path = os.path.join(data_dir, 'p')
-    negative_path = os.path.join(data_dir, 'n')
+    samples: List[Tuple[str, str]] = []
+    has_np = False
+    for lab in ("n", "p"):
+        sub = os.path.join(data_dir, lab)
+        if os.path.isdir(sub):
+            has_np = True
+            imgs = _scan_dir(sub)
+            if limit_per_class and limit_per_class > 0:
+                imgs = imgs[:limit_per_class]
+            samples.extend((fp, lab) for fp in imgs)
 
-    pos_files = glob(os.path.join(positive_path, '*.jpg')) + glob(os.path.join(positive_path, '*.png'))
-    neg_files = glob(os.path.join(negative_path, '*.jpg')) + glob(os.path.join(negative_path, '*.png'))
+    if has_np:
+        return samples
 
-    dataset = [(path, 'p') for path in pos_files] + [(path, 'n') for path in neg_files]
-    
-    if not dataset:
-        print(f"警告: 在目录 {data_dir} 中没有找到任何图片文件。")
-
-    return dataset
+    # 平铺目录（无 n/p）
+    imgs = _scan_dir(data_dir)
+    if limit_per_class and limit_per_class > 0:
+        imgs = imgs[:limit_per_class]
+    return [(fp, "unknown") for fp in imgs]

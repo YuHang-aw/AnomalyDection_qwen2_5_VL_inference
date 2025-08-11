@@ -62,16 +62,26 @@ def _as_image_url_block(path_or_url: str) -> dict:
 # ----------------------------
 # 模式一：集成（本地）推理
 # ----------------------------
+import re
+
 class IntegratedInferenceCore(BaseInferenceCore):
     def __init__(self, model_config: Dict):
         print("正在初始化 [集成模式] 推理核心……")
         try:
-            # 直接把 run_inference 清洗后的 loading_args 传入
             self.model = ChatModel(model_config)
-            print("模型加载成功。")
         except Exception as e:
-            print(f"[集成] 模型加载失败: {e}")
-            raise
+            msg = str(e)
+            # 捕获 HfArgumentParser 的未使用键提示
+            m = re.search(r"Some keys are not used by the HfArgumentParser:\s*\[(.*?)\]", msg)
+            if m:
+                bad = [k.strip(" '\"") for k in m.group(1).split(",")]
+                for k in bad:
+                    model_config.pop(k, None)
+                print(f"[WARN] 自动移除未识别参数并重试：{bad}")
+                self.model = ChatModel(model_config)  # 重试一次
+            else:
+                raise
+        print("模型加载成功。")
 
     def predict(self, text_prompt: str, image_paths: Sequence[str]) -> str:
         # ChatModel 要求：文字放 messages，图片单独放 images 参数

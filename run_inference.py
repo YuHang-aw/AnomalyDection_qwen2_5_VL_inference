@@ -19,33 +19,36 @@ from prompts import build_text_prompt
 # 仅保留 ChatModel 在推理阶段常用、且不会引发 HfArgumentParser 报错的键
 # （如果你的 YAML 里还有别的键，建议放到启动 API 的 YAML 里用。）
 # ----------------------------
+    # 推理后端选
+# run_inference.py
 _ALLOWED_LOADING_KEYS = {
-    # 模型与模板
-    "model_name_or_path", "template",
-
-    # 精度 / 设备
-    "device_map", "torch_dtype", "trust_remote_code",
-
-    # 量化/压缩相关（按需）
-    "quantization_bit", "load_in_4bit", "load_in_8bit",
-
-    # 推理后端选择
-    "infer_backend",  # "hf" / "vllm"（取决于你安装环境）
-    
-    # 适配器（如有）
-    "adapter_name_or_path", "finetuning_type",
-
-    # 其他可能安全的通用键（可按需增删）
-    "flash_attn", "rope_scaling", "max_model_len"
+    # 文档明确：推理必需/可选键
+    "model_name_or_path",
+    "template",
+    "infer_backend",          # "huggingface" / "vllm" / "sglang"
+    "adapter_name_or_path",   # 若使用LoRA/适配器
+    "finetuning_type",        # lora / qlora / full ...
 }
 
+_OPTIONAL_TRY_KEYS = {
+    "quantization_bit",
+    "trust_remote_code",
+    "flash_attn",
+    "rope_scaling",
+    "max_model_len",
+    "torch_dtype",
+    "quantization_device_map",
+}
+
+
 def _sanitize_loading_args(d: dict) -> dict:
-    """过滤掉 ChatModel 不认识的键，避免 HfArgumentParser 报错。"""
-    clean = {k: v for k, v in (d or {}).items() if k in _ALLOWED_LOADING_KEYS}
+    allowed = _ALLOWED_LOADING_KEYS | _OPTIONAL_TRY_KEYS
+    clean = {k: v for k, v in (d or {}).items() if k in allowed}
     dropped = sorted(set((d or {}).keys()) - set(clean.keys()))
     if dropped:
-        print(f"[WARN] 已忽略不被 ChatModel 使用的参数键：{dropped}")
+        print(f"[WARN] 已忽略未在允许列表中的参数键：{dropped}")
     return clean
+
 
 
 def main():
@@ -105,8 +108,12 @@ def main():
         few_dir = inference_cfg.get("fewshot_examples_dir")
         if not few_dir:
             raise ValueError("启用 use_fewshot 时必须提供 fewshot_examples_dir")
-        few_shot_examples = load_dataset(few_dir)
-        print(f"已加载 {len(few_shot_examples)} 个 few-shot 示例。")
+        few_limit = inference_cfg.get("fewshot_limit_per_class")  # 新增可选参数
+        few_shot_examples = load_dataset(few_dir, few_limit)
+        if not few_shot_examples:
+            print("[WARN] few-shot 目录为空，已忽略 few-shot。")
+        else:
+            print(f"已加载 {len(few_shot_examples)} 个 few-shot 示例。")
 
     # --- 5) 推理循环 ---
     inference_mode = inference_cfg.get("mode")

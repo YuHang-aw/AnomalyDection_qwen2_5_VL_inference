@@ -1,70 +1,85 @@
-from PIL import Image, ImageDraw
+# -*- coding: utf-8 -*-
 import os
+from typing import List
+from PIL import Image, ImageDraw
 
-# 禁用Pillow的解压炸弹检查，因为我们要处理大图
-Image.MAX_IMAGE_PIXELS = None
-
-def slice_image(image_path: str, slice_size: int, overlap: int, output_dir: str) -> list[str]:
+def slice_image(image_path: str, slice_size: int, slice_overlap: int, out_dir: str) -> List[str]:
     """
-    将大图切割成带重叠的小图。
-
-    Args:
-        image_path (str): 大图的路径。
-        slice_size (int): 切割后小图的尺寸 (正方形)。
-        overlap (int): 小图之间的重叠像素。
-        output_dir (str): 存放小图的临时目录。
-
-    Returns:
-        list[str]: 所有生成的小图路径列表。
+    把大图切成固定大小的小图（方块），有重叠。
+    返回小图路径列表。
     """
+    os.makedirs(out_dir, exist_ok=True)
     try:
-        img = Image.open(image_path).convert("RGB")
-    except FileNotFoundError:
-        print(f"错误: 找不到图片文件 {image_path}")
+        with Image.open(image_path) as im:
+            im = im.convert("RGB")
+            W, H = im.size
+            step = max(1, slice_size - max(0, slice_overlap))
+            paths = []
+            basename = os.path.splitext(os.path.basename(image_path))[0]
+
+            y = 0
+            while y < H:
+                x = 0
+                y2 = min(H, y + slice_size)
+                if y2 - y < slice_size and y != 0:
+                    y = max(0, H - slice_size)
+                    y2 = H
+                while x < W:
+                    x2 = min(W, x + slice_size)
+                    if x2 - x < slice_size and x != 0:
+                        x = max(0, W - slice_size)
+                        x2 = W
+                    crop = im.crop((x, y, x2, y2))
+                    # 填补边缘不足的块（右下角处），统一输出尺寸
+                    if crop.size != (slice_size, slice_size):
+                        pad = Image.new("RGB", (slice_size, slice_size), (0, 0, 0))
+                        pad.paste(crop, (0, 0))
+                        crop = pad
+
+                    out_name = f"{basename}_y{y}_x{x}.png"
+                    out_path = os.path.join(out_dir, out_name)
+                    crop.save(out_path, format="PNG")
+                    paths.append(out_path)
+
+                    if x2 == W:
+                        break
+                    x += step
+                if y2 == H:
+                    break
+                y += step
+
+            return paths
+    except Exception as e:
+        print(f"[ERR] 切图失败：{image_path} -> {e}")
         return []
 
-    img_w, img_h = img.size
-    stride = slice_size - overlap
-    sliced_image_paths = []
-
-    # 创建独立的子目录存放每个大图的切片
-    base_name = os.path.splitext(os.path.basename(image_path))[0]
-    slice_specific_dir = os.path.join(output_dir, base_name)
-    os.makedirs(slice_specific_dir, exist_ok=True)
-
-    for y in range(0, img_h, stride):
-        for x in range(0, img_w, stride):
-            # 确保不会切出边界
-            box = (x, y, min(x + slice_size, img_w), min(y + slice_size, img_h))
-            
-            # 如果切片太小，可以跳过
-            if (box[2] - box[0]) < overlap or (box[3] - box[1]) < overlap:
-                continue
-
-            slice_img = img.crop(box)
-            
-            slice_filename = f"slice_{y}_{x}.png"
-            slice_path = os.path.join(slice_specific_dir, slice_filename)
-            slice_img.save(slice_path)
-            sliced_image_paths.append(slice_path)
-            
-    return sliced_image_paths
-
-def add_bbox_to_image(image_path: str, output_path: str):
+def add_bbox_to_image(image_path: str, out_path: str, cfg: dict) -> str:
     """
-    在图片中心添加一个示例BBox并保存。
-    在实际应用中，BBox坐标应该来自检测算法或标注数据。
+    在图像中心画一个相对尺寸的方框。失败则回退返回原图路径。
     """
-    img = Image.open(image_path).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    
-    # 示例：在中心绘制一个占图片1/4大小的红色方框
-    w, h = img.size
-    box_w, box_h = w // 2, h // 2
-    x1, y1 = (w - box_w) // 2, (h - box_h) // 2
-    x2, y2 = x1 + box_w, y1 + box_h
-    
-    draw.rectangle([x1, y1, x2, y2], outline="red", width=5)
-    
-    img.save(output_path)
-    return output_path
+    try:
+        with Image.open(image_path) as im:
+            im = im.convert("RGB")
+            W, H = im.size
+            rel = float(cfg.get("relative_size", 0.5))
+            rel = max(0.05, min(rel, 0.95))
+            side = int(min(W, H) * rel)
+            cx, cy = W // 2, H // 2
+            x1 = max(0, cx - side // 2)
+            y1 = max(0, cy - side // 2)
+            x2 = min(W - 1, x1 + side)
+            y2 = min(H - 1, y1 + side)
+
+            color = cfg.get("outline_color", "red")
+            width = int(cfg.get("outline_width", 5))
+
+            draw = ImageDraw.Draw(im)
+            for i in range(width):
+                draw.rectangle([x1 - i, y1 - i, x2 + i, y2 + i], outline=color)
+
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            im.save(out_path)
+            return out_path
+    except Exception as e:
+        print(f"[WARN] 画框失败，使用原图：{image_path} -> {e}")
+        return image_path

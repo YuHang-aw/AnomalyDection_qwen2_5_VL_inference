@@ -12,7 +12,7 @@ execution:
 
   # 仅 api_client 时生效
   api_client_settings:
-    base_url: "http://localhost:8000/v1"
+    base_url: "http://localhost:8086/v1"
     model_name: "qwen"
     api_key: "sk-anything"
     # 新增：健壮性
@@ -39,7 +39,7 @@ model:
     # 可选：LoRA/Adapter
     adapter_name_or_path: null
     # 可选：推理后端（环境支持时生效）
-    infer_backend: "hf"
+    infer_backend: "vllm"
 
 # -----------------------------------
 # 2. 数据与输出设置
@@ -57,6 +57,7 @@ inference:
   mode: "full_image"                # 或 "sliced_image"
   use_fewshot: false
   fewshot_examples_dir: "./few_shot_examples/"
+  fewshot_limit_per_class: 4
   use_bbox: false                   # 仅 full_image 有效
 
 # -----------------------------------
