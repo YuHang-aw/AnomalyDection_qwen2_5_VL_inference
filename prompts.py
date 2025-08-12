@@ -45,16 +45,15 @@ def build_few_shot_examples_text(example_images: List[Tuple[str, str]],
 # prompts.py（只贴需要替换的函数）
 from typing import List, Tuple, Optional, Dict
 
-def build_few_shot_examples_text(example_images: List[Tuple[str, str]],
-                                 show_label: bool = True) -> str:
+def build_few_shot_examples_text(example_images, show_label=True) -> str:
     if not example_images:
-        return "（示例图像见上）"
+        return "（示例图像将按输入顺序提供，编号 S#1, S#2, ...）"
     parts = []
-    for i, (_img, label) in enumerate(example_images, start=1):
-        tag = "异常" if (show_label and label == "p") else ("正常" if (show_label and label == "n") else "")
-        head = f"示例#{i}" + (f"（{tag}）" if tag else "")
-        parts.append(f"{head}\n【提示】: 参考上方示例图像。")
-    return "\n".join(parts).strip()
+    for i, (_img, label) in enumerate(example_images, 1):
+        tag = "异常" if (show_label and label == "p") else ("正常" if (show_label and label == "n") else "未标注")
+        parts.append(f"示例 S#{i}（{tag}）：请参考对应示例图像的关键区域与纹理特征。")
+    return "\n".join(parts)
+
 
 def build_text_prompt(
     prompt_template: str,

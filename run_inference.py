@@ -90,19 +90,20 @@ def _atomic_write_json(path: str, obj) -> None:
         tmp_path = tmp.name
     os.replace(tmp_path, path)
 
-def _maybe_attach_prompt(result_dict, text_prompt, images_for_prompt, inference_cfg):
-    """按配置把 prompt 内容写进结果里，支持截断与是否记录图片列表。"""
+def _maybe_attach_prompt(result_dict, text_prompt, images_for_prompt, inference_cfg, manifest=None):
     if not _cfg_bool(inference_cfg, "save_prompt_text", False):
         return
     max_chars = _cfg_int(inference_cfg, "save_prompt_max_chars", 8000)
     txt = text_prompt or ""
     result_dict["prompt_text"] = txt[:max_chars]
-    if len(txt) > max_chars:
-        result_dict["prompt_text_truncated"] = True
-        result_dict["prompt_text_total_len"] = len(txt)
-    if _cfg_bool(inference_cfg, "save_prompt_images", True) and images_for_prompt:
-        # 记录本轮传入的图片列表（few-shot 在前，被测在后）
-        result_dict["prompt_images"] = list(images_for_prompt)
+    result_dict["prompt_text_truncated"] = (len(txt) > max_chars)
+    if _cfg_bool(inference_cfg, "save_prompt_images", True):
+        # 兼容旧字段
+        result_dict["prompt_images"] = list(images_for_prompt or [])
+        # 新字段：结构化清单（更易复现/排错）
+        if manifest:
+            result_dict["prompt_image_manifest"] = manifest
+
 
 def _get_crops_cfg(config: dict) -> dict:
     """
@@ -186,6 +187,15 @@ def main():
         if extra: meta.update(extra)
         _atomic_write_json(checkpoint_path, {"meta": meta, "results_so_far": results})
 
+    # —— 小工具：构建图片清单（few-shot: S#i；eval: #k）
+    def _build_manifest(few_shot_examples, eval_paths):
+        manifest = []
+        for i, (p, _lb) in enumerate(few_shot_examples or [], 1):
+            manifest.append({"path": p, "role": "fewshot", "index": i, "tag": f"S#{i}"})
+        for k, p in enumerate(eval_paths or [], 1):
+            manifest.append({"path": p, "role": "eval", "index": k, "tag": f"#{k}"})
+        return manifest
+
     # 5) few-shot
     inference_cfg = config.get("inference", {}) or {}
     use_fewshot = _cfg_bool(inference_cfg, "use_fewshot", False)
@@ -215,7 +225,6 @@ def main():
 
     # 7) 模板选择
     prompt_templates = config.get("prompts", {}) or {}
-    system_prompt = prompt_templates.get("system", "")
     def _get_template(key: str, fallback: str = "zero_shot") -> str:
         tpl = prompt_templates.get(key) or prompt_templates.get(fallback)
         if not tpl:
@@ -229,17 +238,13 @@ def main():
 
             # 决定模板
             if use_fewshot and use_bbox:
-                prompt_key = "few_shot_with_bbox_base"
-                prompt_type = "few_shot_bbox"
+                prompt_key = "few_shot_with_bbox_base"; prompt_type = "few_shot_bbox"
             elif use_bbox:
-                prompt_key = "bbox"
-                prompt_type = "bbox"
+                prompt_key = "bbox"; prompt_type = "bbox"
             elif use_fewshot:
-                prompt_key = "few_shot_base"
-                prompt_type = "few_shot"
+                prompt_key = "few_shot_base"; prompt_type = "few_shot"
             else:
-                prompt_key = "zero_shot"
-                prompt_type = "zero_shot"
+                prompt_key = "zero_shot"; prompt_type = "zero_shot"
             prompt_template = _get_template(prompt_key)
 
             for image_path, true_label in tqdm(dataset, desc="处理大图中"):
@@ -253,7 +258,10 @@ def main():
 
                 # 2) 文本 prompt（只文字）
                 num_few = len(few_shot_examples) if use_fewshot else 0
-                order_hint = f"图片顺序：前 {num_few} 张为示例（示例#1…#{num_few}），最后 1 张为待判定图。" if num_few else ""
+                if num_few:
+                    order_hint = f"图片顺序：示例 {num_few} 张（S#1…S#{num_few}）在前；待判定 1 张（#1）在后。"
+                else:
+                    order_hint = "将提供 1 张待判定图（#1）。"
                 text_prompt = build_text_prompt(
                     prompt_template=prompt_template,
                     few_shot_examples=few_shot_examples if use_fewshot else None,
@@ -262,10 +270,11 @@ def main():
                 )
 
                 # 3) 图片列表（few-shot 在前，待测在后）
-                images_for_prompt = [ex[0] for ex in few_shot_examples] if use_fewshot else []
-                images_for_prompt.append(image_to_process)
+                eval_list = [image_to_process]
+                images_for_prompt = ([ex[0] for ex in few_shot_examples] if use_fewshot else []) + eval_list
+                manifest = _build_manifest(few_shot_examples if use_fewshot else [], eval_list)
 
-                # 4) 调用推理
+                # 4) 推理
                 try:
                     response = core.predict(text_prompt, images_for_prompt)
                     item = {
@@ -273,6 +282,7 @@ def main():
                         "true_label": true_label,
                         "prompt_type": prompt_type,
                         "model_response": response,
+                        "prompt_image_manifest": manifest,
                     }
                 except Exception as e:
                     err = f"{type(e).__name__}: {e}"
@@ -283,6 +293,7 @@ def main():
                         "prompt_type": prompt_type,
                         "error": err,
                         "traceback": traceback.format_exc(),
+                        "prompt_image_manifest": manifest,
                     }
 
                 _maybe_attach_prompt(item, text_prompt, images_for_prompt, inference_cfg)
@@ -311,18 +322,19 @@ def main():
                 windows = generate_random_windows(image_path, crops_cfg, temp_dir)
                 win_paths = [w["path"] for w in windows][:max_per_round]
 
-                k = len(win_paths)
-                order_hint = f"本轮共有 {k} 张待判定图，按输入顺序记为 #1…#{k}。请逐图输出结果并用编号标注。"
-                text_prompt = build_text_prompt(
-                    prompt_template=prompt_template,
-                    few_shot_examples=few_shot_examples if use_fewshot else None,
-                    show_fewshot_label=_cfg_bool(inference_cfg, "fewshot_label_hint", True),
-                    placeholders={"image_order_hint": order_hint}
-                )
-
-
                 if multi_image:
-                    images_for_prompt = base_images + win_paths
+                    k = len(win_paths)
+                    order_hint = f"本轮共有 {k} 张待判定图，按输入顺序编号为 #1…#{k}；若提供示例（S#1…），仅供参考。"
+                    text_prompt = build_text_prompt(
+                        prompt_template=prompt_template,
+                        few_shot_examples=few_shot_examples if use_fewshot else None,
+                        show_fewshot_label=_cfg_bool(inference_cfg, "fewshot_label_hint", True),
+                        placeholders={"image_order_hint": order_hint}
+                    )
+                    eval_list = win_paths
+                    images_for_prompt = base_images + eval_list
+                    manifest = _build_manifest(few_shot_examples if use_fewshot else [], eval_list)
+
                     response = core.predict(text_prompt, images_for_prompt)
                     item = {
                         "image_path": image_path,
@@ -330,10 +342,20 @@ def main():
                         "prompt_type": "random_crops_multi",
                         "windows": windows,
                         "model_response": response,
+                        "prompt_image_manifest": manifest,
                     }
                     _maybe_attach_prompt(item, text_prompt, images_for_prompt, inference_cfg)
                     results.append(item)
+
                 else:
+                    # 单窗多轮：每轮只有 #1
+                    order_hint = "本轮按单窗逐次判定；每次仅 1 张待判定图（#1）。若提供示例（S#1…），仅供参考。"
+                    text_prompt = build_text_prompt(
+                        prompt_template=prompt_template,
+                        few_shot_examples=few_shot_examples if use_fewshot else None,
+                        show_fewshot_label=_cfg_bool(inference_cfg, "fewshot_label_hint", True),
+                        placeholders={"image_order_hint": order_hint}
+                    )
                     perwin = []
                     abnormal = False
                     for pth in win_paths:
@@ -343,6 +365,8 @@ def main():
                         if "【判断】: 异常" in str(resp):
                             abnormal = True
 
+                    # 统一清单（把所有窗记为 #1…#K）
+                    manifest = _build_manifest(few_shot_examples if use_fewshot else [], win_paths)
                     item = {
                         "image_path": image_path,
                         "true_label": true_label,
@@ -350,8 +374,9 @@ def main():
                         "windows": windows,
                         "final_decision": "异常" if abnormal else "正常",
                         "per_window": perwin,
+                        "prompt_image_manifest": manifest,
                     }
-                    # 只在整图层记录一次 prompt
+                    # 在整图层记录一次 prompt（避免过大）
                     _maybe_attach_prompt(item, text_prompt, base_images + ["<random-crop>"], inference_cfg)
                     results.append(item)
 
@@ -363,24 +388,21 @@ def main():
             slice_size = _cfg_int(slicing_cfg, "slice_size", 768)
             slice_overlap = _cfg_int(slicing_cfg, "slice_overlap", 128)
 
-            # 模板
-            prompt_template = _get_template("few_shot_base" if use_fewshot else "zero_shot")
-
-            # 统一文本 prompt（所有切片共用）
-            k = len(sliced_paths)
-            order_hint = f"该大图被切成 {k} 张切片，按输入顺序编号 #1…#{k}，请逐张判定并可引用编号。"
-            text_prompt = build_text_prompt(
-                prompt_template=prompt_template,
-                few_shot_examples=few_shot_examples if use_fewshot else None,
-                show_fewshot_label=_cfg_bool(inference_cfg, "fewshot_label_hint", True),
-                placeholders={"image_order_hint": order_hint}
-            )
-
+            # 模板（不含切片数，因每张大图不同，稍后逐图注入）
+            base_template = _get_template("few_shot_base" if use_fewshot else "zero_shot")
             base_images = [ex[0] for ex in few_shot_examples] if use_fewshot else []
-
             temp_dir = os.path.join(output_dir, "temp_sliced_images")
+
             for image_path, true_label in tqdm(dataset, desc="处理大图中"):
                 sliced_paths = slice_image(image_path, slice_size, slice_overlap, temp_dir)
+                k = len(sliced_paths)
+                order_hint = f"该大图被切成 {k} 张切片（#1…#{k}）；若提供示例（S#1…），仅供参考。"
+                text_prompt = build_text_prompt(
+                    prompt_template=base_template,
+                    few_shot_examples=few_shot_examples if use_fewshot else None,
+                    show_fewshot_label=_cfg_bool(inference_cfg, "fewshot_label_hint", True),
+                    placeholders={"image_order_hint": order_hint}
+                )
 
                 abnormal_slice_found = False
                 slice_responses = []
@@ -396,6 +418,7 @@ def main():
                         print(f"[ERR] 切片推理失败：{slice_path} -> {err}")
                         slice_responses.append({"slice": os.path.basename(slice_path), "error": err})
 
+                manifest = _build_manifest(few_shot_examples if use_fewshot else [], sliced_paths)
                 final_decision = "异常" if abnormal_slice_found else "正常"
                 item = {
                     "image_path": image_path,
@@ -403,7 +426,9 @@ def main():
                     "prompt_type": "sliced_image",
                     "final_decision": final_decision,
                     "slice_details": slice_responses,
+                    "prompt_image_manifest": manifest,
                 }
+                # 记录统一的 text_prompt 与“基准图片清单”占位，避免爆文件
                 _maybe_attach_prompt(item, text_prompt, base_images + ["<slice>"], inference_cfg)
                 results.append(item)
                 save_checkpoint({"last_image": os.path.basename(image_path)})
