@@ -49,7 +49,9 @@ data:
   output_dir: "./results/"
   results_filename: "auto"
   limit_samples_per_category: 0
-
+  max_samples_total: 10               # ☆ 全局最多推理 10 张
+  shuffle: true                       # ☆ 随机打乱后再截取
+  seed: 42
 # -----------------------------------
 # 3. 推理任务控制
 # -----------------------------------
@@ -61,7 +63,17 @@ inference:
   fewshot_label_hint: false         # ☆ 关闭 few-shot 文本里的“参考判定：异常/正常”
   exclude_fewshot_from_eval: true 
   use_bbox: false                   # 仅 full_image 有效
+  # 新增：random_crops
+  multi_image_per_round: true   # ← 多图一轮（≤6 窗口）
 
+slicing:                         # 随机裁剪使用这个段
+  include_global: true
+  global_downscale_max_side: 1408  # 控制全局视图大小，节省视觉 token
+  random_sizes: [512, 768]         # 裂缝细，建议含 512/640/768 等
+  random_per_size: 3               # 每个尺寸抽 3 个
+  random_jitter: 0.15              # 尺寸±15% 抖动
+  max_windows_per_round: 6         # ☆ 严格 ≤ 6
+  seed: 42
 # -----------------------------------
 # 4. BBox 设置（仅 use_bbox=true 时）
 # -----------------------------------
@@ -115,3 +127,10 @@ prompts:
     现在仅聚焦新图中的红框区域，完成诊断：
     【判断】: 异常/正常
     【分析】: 解释框内的具体依据、异常类型与位置。
+    
+  prompts.multi_crop_base: |
+    请逐一判断我提供的多张图像（按顺序编号 #1, #2, ...）。
+    每张图按如下格式输出一行：
+    【图#k】【判断】: 正常/异常；【理由】: <简要依据>；【定位】: <若能指出区域请描述>
+
+    {few_shot_examples}

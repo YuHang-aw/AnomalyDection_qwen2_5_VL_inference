@@ -7,14 +7,12 @@ from tqdm import tqdm
 import time
 import tempfile
 import traceback
-
+import random
 # 核心模块：根据配置选择不同的推理引擎
 from inference_core import IntegratedInferenceCore, ApiClientInferenceCore
-
 # 工具模块：数据加载和图像处理（注意：你的 utils 里 load_dataset 要支持 (data_dir, limit) 两参）
 from utils.dataset_loader import load_dataset
-from utils.image_processor import slice_image, add_bbox_to_image
-
+from utils.image_processor import slice_image, add_bbox_to_image, generate_random_windows
 # Prompt 构建模块（新版：只产出“文本”，图片分开传）
 from prompts import build_text_prompt
 
@@ -105,6 +103,7 @@ def main():
     # --- 1) 读取配置 ---
     parser = argparse.ArgumentParser(description="Qwen-VL 衬砌板异常检测（支持集成/API双模式）")
     parser.add_argument("--config", type=str, default="config.yaml", help="配置文件路径")
+    parser.add_argument("--max-samples", type=int, default=20, help="本次最多推理多少张（全局上限）")
     args = parser.parse_args()
 
     try:
@@ -186,7 +185,18 @@ def main():
             removed = before - len(dataset)
             if removed > 0:
                 print(f"[INFO] 已从评测集中剔除 few-shot 样本：{removed} 张")
+    # 可选随机顺序，避免总是取前几张
+    shuffle = bool(data_cfg.get("shuffle", False))
+    seed = int(data_cfg.get("seed", 42))
+    if shuffle:
+        rng = random.Random(seed)
+        rng.shuffle(dataset)
 
+    # 全局上限：优先命令行，其次 YAML
+    max_total = args.max_samples if args.max_samples is not None else data_cfg.get("max_samples_total")
+    if max_total and int(max_total) > 0:
+        dataset = dataset[:int(max_total)]
+    print(f"[INFO] 将进行 {len(dataset)} 张样本的推理。")
     # --- 5) 推理循环 ---
     inference_mode = inference_cfg.get("mode")
     if inference_mode not in {"full_image", "sliced_image"}:
@@ -281,6 +291,67 @@ def main():
 
                 results.append(result_item)
                 # 写检查点
+                save_checkpoint({"last_image": os.path.basename(image_path)})
+        elif inference_mode == "random_crops":
+            print("\n任务: [随机裁剪 - 全局+局部]")
+            cropping_cfg = config.get("slicing", {})  # 复用 slicing 段做裁剪配置
+            use_fewshot = inference_cfg.get("use_fewshot", False)
+            multi_image = bool(inference_cfg.get("multi_image_per_round", True))  # ☆ 多图一轮
+            max_per_round = int(cropping_cfg.get("max_windows_per_round", 6))
+
+            # 模板：多图一轮建议用专门模板（逐图编号输出）；若没给就回落
+            prompt_template_key = "multi_crop_base" if multi_image else "zero_shot"
+            if use_fewshot:
+                prompt_template_key = "few_shot_multi_crop" if multi_image else "few_shot_base"
+
+            prompt_template = prompt_templates.get(prompt_template_key) or prompt_templates.get("zero_shot")
+            if not prompt_template:
+                raise ValueError(f"缺少 prompts.{prompt_template_key} 或 prompts.zero_shot 模板")
+
+            base_images = [ex[0] for ex in few_shot_examples] if use_fewshot else []
+
+            for image_path, true_label in tqdm(dataset, desc="处理大图中"):
+                # 生成「全局 + 随机局部」窗口，已限制到 ≤ max_per_round
+                temp_crop_dir = os.path.join(output_dir, "temp_random_crops")
+                windows = generate_random_windows(image_path, cropping_cfg, temp_crop_dir)
+                win_paths = [w["path"] for w in windows][:max_per_round]
+
+                # 文本提示：建议模板里要求“按编号逐一判断”，便于解析
+                text_prompt = build_text_prompt(
+                    prompt_template=prompt_template,
+                    few_shot_examples=few_shot_examples if use_fewshot else None
+                )
+
+                if multi_image:
+                    images_for_prompt = base_images + win_paths
+                    response = core.predict(text_prompt, images_for_prompt)
+                    results.append({
+                        "image_path": image_path,
+                        "true_label": true_label,
+                        "prompt_type": "random_crops_multi",
+                        "windows": windows,              # 记录窗位置/尺寸元数据
+                        "model_response": response       # 一轮返回（模板应逐窗给出判断）
+                    })
+                else:
+                    # 单窗多轮
+                    perwin = []
+                    abnormal = False
+                    for pth in win_paths:
+                        images_for_prompt = base_images + [pth]
+                        resp = core.predict(text_prompt, images_for_prompt)
+                        perwin.append({"crop_path": pth, "response": resp})
+                        if "【判断】: 异常" in str(resp):
+                            abnormal = True
+                    results.append({
+                        "image_path": image_path,
+                        "true_label": true_label,
+                        "prompt_type": "random_crops_single",
+                        "windows": windows,
+                        "final_decision": "异常" if abnormal else "正常",
+                        "per_window": perwin
+                    })
+
+                # 写检查点（沿用你现有的 save_checkpoint 调用）
                 save_checkpoint({"last_image": os.path.basename(image_path)})
 
         elif inference_mode == "sliced_image":
