@@ -98,6 +98,19 @@ def _atomic_write_json(path: str, obj) -> None:
         tmp_path = tmp.name
     os.replace(tmp_path, path)
 
+def _maybe_attach_prompt(result_dict, text_prompt, images_for_prompt, inference_cfg):
+    """按配置把 prompt 内容写进结果里，支持截断与是否记录图片列表。"""
+    if not inference_cfg.get("save_prompt_text", False):
+        return
+    max_chars = int(inference_cfg.get("save_prompt_max_chars", 8000))
+    txt = text_prompt or ""
+    result_dict["prompt_text"] = txt[:max_chars]
+    if len(txt) > max_chars:
+        result_dict["prompt_text_truncated"] = True
+        result_dict["prompt_text_total_len"] = len(txt)
+    if inference_cfg.get("save_prompt_images", True) and images_for_prompt:
+        # 记录当次调用里随 prompt 一起送入模型的图片列表（few-shot 在前，被测在后）
+        result_dict["prompt_images"] = list(images_for_prompt)
 
 def main():
     # --- 1) 读取配置 ---
@@ -199,7 +212,8 @@ def main():
     print(f"[INFO] 将进行 {len(dataset)} 张样本的推理。")
     # --- 5) 推理循环 ---
     inference_mode = inference_cfg.get("mode")
-    if inference_mode not in {"full_image", "sliced_image"}:
+    valid_modes = {"full_image", "sliced_image", "random_crops"}   # ← 加上
+    if inference_mode not in valid_modes:
         raise ValueError(f"未知的 inference.mode: {inference_mode}")
 
     prompt_templates = config.get("prompts", {})
@@ -288,7 +302,7 @@ def main():
                         "traceback": traceback.format_exc(),
                         "prompt_type": prompt_type
                     }
-
+                _maybe_attach_prompt(result_item, text_prompt, images_for_prompt, inference_cfg) 
                 results.append(result_item)
                 # 写检查点
                 save_checkpoint({"last_image": os.path.basename(image_path)})
@@ -325,13 +339,16 @@ def main():
                 if multi_image:
                     images_for_prompt = base_images + win_paths
                     response = core.predict(text_prompt, images_for_prompt)
-                    results.append({
+                    item = {
                         "image_path": image_path,
                         "true_label": true_label,
                         "prompt_type": "random_crops_multi",
-                        "windows": windows,              # 记录窗位置/尺寸元数据
-                        "model_response": response       # 一轮返回（模板应逐窗给出判断）
-                    })
+                        "windows": windows,
+                        "model_response": response
+                    }
+                    _maybe_attach_prompt(item, text_prompt, images_for_prompt, inference_cfg)
+                    results.append(item)
+
                 else:
                     # 单窗多轮
                     perwin = []
@@ -339,17 +356,25 @@ def main():
                     for pth in win_paths:
                         images_for_prompt = base_images + [pth]
                         resp = core.predict(text_prompt, images_for_prompt)
-                        perwin.append({"crop_path": pth, "response": resp})
+                        row = {"crop_path": pth, "response": resp}
+                        # 如需每窗也记录 prompt，可解除下一行注释（文件会更大）
+                        # _maybe_attach_prompt(row, text_prompt, images_for_prompt, inference_cfg)
+                        perwin.append(row)
                         if "【判断】: 异常" in str(resp):
                             abnormal = True
-                    results.append({
+
+                    item = {
                         "image_path": image_path,
                         "true_label": true_label,
                         "prompt_type": "random_crops_single",
                         "windows": windows,
                         "final_decision": "异常" if abnormal else "正常",
                         "per_window": perwin
-                    })
+                    }
+                    # 在整图层记录一次即可
+                    _maybe_attach_prompt(item, text_prompt, base_images + ["<random-crop>"], inference_cfg)
+                    results.append(item)
+
 
                 # 写检查点（沿用你现有的 save_checkpoint 调用）
                 save_checkpoint({"last_image": os.path.basename(image_path)})
@@ -409,13 +434,18 @@ def main():
                         })
 
                 final_decision = "异常" if abnormal_slice_found else "正常"
-                results.append({
+                # 在该大图所有切片跑完后、append 之前：
+                result_item = {
                     "image_path": image_path,
                     "true_label": true_label,
                     "final_decision": final_decision,
                     "prompt_type": prompt_type,
                     "slice_details": slice_responses
-                })
+                }
+                # 记录用于切片推理的统一 text_prompt（不必重复到每个 slice）
+                _maybe_attach_prompt(result_item, text_prompt, base_images + ["<slice>"], inference_cfg)
+                results.append(result_item)
+
 
                 # 写检查点
                 save_checkpoint({"last_image": os.path.basename(image_path)})

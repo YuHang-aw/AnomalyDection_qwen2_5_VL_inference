@@ -65,6 +65,11 @@ inference:
   use_bbox: false                   # 仅 full_image 有效
   # 新增：random_crops
   multi_image_per_round: true   # ← 多图一轮（≤6 窗口）
+  inference:
+  save_prompt_text: true           # 开启就会把 prompt_text 写进结果
+  save_prompt_max_chars: 8000      # 防止超长；你也可以调成 20000
+  save_prompt_images: true         # 是否把该次调用送入的图片列表也记下来
+
 
 slicing:                         # 随机裁剪使用这个段
   include_global: true
@@ -127,7 +132,7 @@ prompts:
     现在仅聚焦新图中的红框区域，完成诊断：
     【判断】: 异常/正常
     【分析】: 解释框内的具体依据、异常类型与位置。
-    
+
   prompts.multi_crop_base: |
     请逐一判断我提供的多张图像（按顺序编号 #1, #2, ...）。
     每张图按如下格式输出一行：
