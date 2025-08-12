@@ -16,34 +16,9 @@ from typing import List, Tuple, Sequence, Optional, Union, Dict
 from PIL import Image
 
 # ----------------------------
-# Few-shot 文本块（仅文字说明）
-# ----------------------------
-def build_few_shot_examples_text(example_images: List[Tuple[str, str]],
-                                 show_label: bool = True) -> str:
-    """
-    :param example_images: [(img_path, label)], label: 'p'(异常) / 'n'(正常) / 其它
-    :return: 多个示例的文本描述（不包含图片占位符）
-    """
-    if not example_images:
-        return "（示例图像见上）"
-    parts: List[str] = []
-    for i, (_img, label) in enumerate(example_images, start=1):
-        if show_label and label in ("p", "n"):
-            status = "异常" if label == "p" else "正常"
-            parts.append(
-                f"示例 {i}（{status}）\n"
-                f"【判断】: {status}\n"
-                f"【分析】: 请参考上方示例图像中的关键区域与纹理特征。\n"
-            )
-        else:
-            parts.append(f"示例 {i}\n【提示】: 参考上方示例图像。")
-    return "\n".join(parts).strip()
-
-# ----------------------------
 # 模板渲染（只负责文本）
 # ----------------------------
 # prompts.py（只贴需要替换的函数）
-from typing import List, Tuple, Optional, Dict
 
 def build_few_shot_examples_text(example_images, show_label=True) -> str:
     if not example_images:
