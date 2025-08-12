@@ -70,7 +70,12 @@ inference:
 
   # BBox（仅 full_image 生效；需要 bbox_settings 有效来源）
   use_bbox: false
-
+  use_region_hints: true           # ← 开关，只控制“把矩形提示写进文本”
+  region_hints:
+    include_labels: true           # 是否把 LabelMe 的 label 带上
+    coords: "xyxy"                 # "xyxy" 或 "xywh"
+    max_regions: 6                 # 最多提示多少个框
+    require_annotations: false 
   # random_crops 专用
   multi_image_per_round: true        # 多窗一轮（≤ crops.max_windows_per_round）
 

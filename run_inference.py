@@ -13,6 +13,8 @@ import random
 from inference_core import IntegratedInferenceCore, ApiClientInferenceCore
 from utils.dataset_loader import load_dataset
 from utils.image_processor import slice_image, add_bbox_to_image, generate_random_windows
+from utils.region_hints import build_region_hints_text
+
 from prompts import build_text_prompt
 
 # 允许的加载参数（避免 HfArgumentParser 报错）
@@ -262,12 +264,31 @@ def main():
                     order_hint = f"图片顺序：示例 {num_few} 张（S#1…S#{num_few}）在前；待判定 1 张（#1）在后。"
                 else:
                     order_hint = "将提供 1 张待判定图（#1）。"
+
+                # ---- 构造 placeholders，并在需要时注入 region_hints ----
+                placeholders = {"image_order_hint": order_hint}
+
+                region_hints_cfg = (inference_cfg.get("region_hints") or {})
+                if bool(region_hints_cfg.get("enabled", False)):
+                    try:
+                        # 使用“原图”的尺寸与坐标系生成 hints 文本（与是否画红框无关）
+                        placeholders["region_hints"] = build_region_hints_text(
+                            image_path=image_path,
+                            cfg=region_hints_cfg
+                        )
+                    except Exception as e:
+                        print(f"[WARN] 生成 region_hints 失败（{os.path.basename(image_path)}）：{e}")
+                        placeholders["region_hints"] = ""
+                else:
+                    placeholders["region_hints"] = ""
+
                 text_prompt = build_text_prompt(
                     prompt_template=prompt_template,
                     few_shot_examples=few_shot_examples if use_fewshot else None,
                     show_fewshot_label=_cfg_bool(inference_cfg, "fewshot_label_hint", True),
-                    placeholders={"image_order_hint": order_hint}
+                    placeholders=placeholders   # ← 关键：把占位字典传进去
                 )
+
 
                 # 3) 图片列表（few-shot 在前，待测在后）
                 eval_list = [image_to_process]
