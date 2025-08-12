@@ -1,13 +1,13 @@
 # ===================================================================
-# Qwen-VL 衬砌板异常检测 - 综合实验配置文件 v3.1
+# Qwen-VL 衬砌板异常检测 - 标准配置 v3.2（精简稳固版）
 # ===================================================================
 
 # -----------------------------------
-# 0. 执行模式控制
+# 0) 执行模式
 # -----------------------------------
 execution:
-  # "integrated": 直接在本进程加载模型（快速调试）
-  # "api_client": 走 OpenAI 兼容 API（生产/并发/常驻）
+  # integrated: 直接在本进程加载模型
+  # api_client: 走 OpenAI 兼容 API
   mode: "integrated"
 
   # 仅 api_client 时生效
@@ -15,105 +15,137 @@ execution:
     base_url: "http://localhost:8086/v1"
     model_name: "qwen"
     api_key: "sk-anything"
-    # 新增：健壮性
-    request_timeout_s: 120          # 单次请求超时（秒）
-    max_retries: 3                  # 失败重试次数
+    request_timeout_s: 120
+    max_retries: 3
     temperature: 0.1
     max_tokens: 2048
 
 # -----------------------------------
-# 1. 模型与加载设置（仅 integrated 使用）
+# 1) 模型加载（仅 integrated 使用）
 # -----------------------------------
 model:
   # 模型路径或 Hub 名称
   path: "Qwen/Qwen2.5-VL-Max-Chat"
 
-  # 传给 ChatModel 的参数（已在 run_inference 内做白名单过滤）
+  # 传给 ChatModel 的参数（已在 run_inference 里做白名单过滤）
   loading_args:
-    template: "qwen2_vl"            # Qwen 2/2.5-VL 常用模板
+    template: "qwen2_vl"          # Qwen 2/2.5-VL 常用模板
     device_map: "auto"
     trust_remote_code: true
     # 性能/量化（按需）
     flash_attn: "auto"
     quantization_bit: 4
-    # 可选：LoRA/Adapter
+    # 适配器（可选）
     adapter_name_or_path: null
-    # 可选：推理后端（环境支持时生效）
+    # 推理后端（环境支持时生效）
     infer_backend: "vllm"
 
 # -----------------------------------
-# 2. 数据与输出设置
+# 2) 数据与输出
 # -----------------------------------
 data:
   data_dir: "./my_tunnel_data/"
   output_dir: "./results/"
-  results_filename: "auto"
-  limit_samples_per_category: 0
-  max_samples_total: 10               # ☆ 全局最多推理 10 张
-  shuffle: true                       # ☆ 随机打乱后再截取
+  results_filename: "auto"         # "auto" 或自定义文件名
+  checkpoint_filename: "auto"      # "auto"：带时间戳的检查点
+  limit_samples_per_category: 0    # 0 表示不限
+  max_samples_total: 10            # ☆ 本次最多推理 N 张（全局）
+  shuffle: true
   seed: 42
+  # debug_prompt_once: true        # （可选）打印首个样本的 prompt 与图片列表
+
 # -----------------------------------
-# 3. 推理任务控制
+# 3) 推理任务控制
 # -----------------------------------
 inference:
-  mode: "full_image"                # 或 "sliced_image"
+  # "full_image" | "sliced_image" | "random_crops"
+  mode: "full_image"
+
+  # few-shot
   use_fewshot: false
   fewshot_examples_dir: "./few_shot_examples/"
   fewshot_limit_per_class: 4
-  fewshot_label_hint: false         # ☆ 关闭 few-shot 文本里的“参考判定：异常/正常”
-  exclude_fewshot_from_eval: true 
-  use_bbox: false                   # 仅 full_image 有效
-  # 新增：random_crops
-  multi_image_per_round: true   # ← 多图一轮（≤6 窗口）
-  inference:
-  save_prompt_text: true           # 开启就会把 prompt_text 写进结果
-  save_prompt_max_chars: 8000      # 防止超长；你也可以调成 20000
-  save_prompt_images: true         # 是否把该次调用送入的图片列表也记下来
+  fewshot_label_hint: false          # few-shot 文本中是否显示“参考判定”
+  exclude_fewshot_from_eval: true    # few-shot 样本不参与评测
 
+  # BBox（仅 full_image 生效；需要 bbox_settings 有效来源）
+  use_bbox: false
 
-slicing:                         # 随机裁剪使用这个段
-  include_global: true
-  global_downscale_max_side: 1408  # 控制全局视图大小，节省视觉 token
-  random_sizes: [512, 768]         # 裂缝细，建议含 512/640/768 等
-  random_per_size: 3               # 每个尺寸抽 3 个
-  random_jitter: 0.15              # 尺寸±15% 抖动
-  max_windows_per_round: 6         # ☆ 严格 ≤ 6
-  seed: 42
+  # random_crops 专用
+  multi_image_per_round: true        # 多窗一轮（≤ crops.max_windows_per_round）
+
+  # 结果中保存 prompt
+  save_prompt_text: true
+  save_prompt_max_chars: 8000
+  save_prompt_images: true
+
 # -----------------------------------
-# 4. BBox 设置（仅 use_bbox=true 时）
+# 4) 随机裁剪/多窗设置（random_crops 使用）
+# -----------------------------------
+crops:
+  include_global: true               # 先放一张全局图（可按 global_downscale_max_side 缩小）
+  global_downscale_max_side: 1408
+  random_sizes: [512, 768]
+  random_per_size: 3
+  random_jitter: 0.15
+  max_windows_per_round: 6           # ☆ 严格 ≤ 6
+  seed: 42
+
+# -----------------------------------
+# 5) BBox 设置（与 add_bbox_to_image 对齐）
+# 说明：三选一提供来源；都不提供则不会画框（即回退原图）。
 # -----------------------------------
 bbox_settings:
-  source: "auto_generate"
-  relative_size: 0.5
-  outline_color: "red"
-  outline_width: 5
+  # 5.1 直接给框（像素或 0~1 归一化），二选一
+  boxes: []                          # 形如 [{x1:..,y1:..,x2:..,y2:..,label:"crack"}, [x1,y1,x2,y2], ...]
+  boxes_normalized: false            # 若给的是 0~1 值则设为 true；留空则自动判断
+
+  # 5.2 YOLO 旁文件：labels_dir/xxx.txt，每行 "cls cx cy w h"（默认归一化）
+  labels_dir: null                   # 如: "./labels_yolo"
+  yolo_normalized: true
+
+  # 5.3 简单 JSON 旁文件：annotations_dir/xxx.bboxes.json，内容为 [ {x1,y1,x2,y2,label?}, ... ]
+  annotations_dir: null              # 如: "./ann_json"
+
+  # 可视化样式
+  color: "red"                       # 也可 "#00FF00"
+  line_width: 4
+  show_label: true
+  fill_alpha: 0                      # 0=不填充；(0,255] 越大越不透明
+  label_bg_alpha: 160
 
 # -----------------------------------
-# 5. 切割参数（仅 sliced_image）
+# 6) 网格切片（sliced_image 使用）
 # -----------------------------------
 slicing:
   slice_size: 768
   slice_overlap: 128
 
 # -----------------------------------
-# 6. Prompt 模板配置（不再使用 <image> 或 {image_token}）
+# 7) Prompt 模板（不使用 <image> 或 {image_token}）
+#    支持占位符：
+#      {few_shot_examples}   —— few-shot 的文字说明（示例#1/#2...）
+#      {image_order_hint}    —— 由程序按场景注入的编号提示（#1/#2/...）
 # -----------------------------------
 prompts:
   system: |
     你是一个谨慎、严谨的隧道结构安全检测工程师，请给出可复核、可落地的判断与依据。
 
   zero_shot: |
+    {image_order_hint}
     请严格检查这张衬砌板图片是否存在结构性缺陷（如裂缝、渗水、破损、剥落、异常污染等）。
     请按以下格式输出：
     【判断】: 异常/正常
     【分析】: 说明判断依据；若为异常，请描述类型、位置与严重程度。
 
   bbox: |
+    {image_order_hint}
     这张图中已用红框标出重点区域。仅聚焦框内进行判断：
     【判断】: 异常/正常
     【分析】: 说明框内的具体情况、判断依据与不确定性。
 
   few_shot_base: |
+    {image_order_hint}
     下面是若干“学习示例”，请参考其判断口径与解释风格完成新图分析：
     --- 示例开始 ---
     {few_shot_examples}
@@ -124,6 +156,7 @@ prompts:
     【分析】: 清晰说明理由与位置；保持与示例一致的口径。
 
   few_shot_with_bbox_base: |
+    {image_order_hint}
     先学习以下示例的判断标准与表达风格：
     --- 学习示例开始 ---
     {few_shot_examples}
@@ -133,9 +166,10 @@ prompts:
     【判断】: 异常/正常
     【分析】: 解释框内的具体依据、异常类型与位置。
 
-  prompts.multi_crop_base: |
+  multi_crop_base: |
+    {image_order_hint}
     请逐一判断我提供的多张图像（按顺序编号 #1, #2, ...）。
     每张图按如下格式输出一行：
     【图#k】【判断】: 正常/异常；【理由】: <简要依据>；【定位】: <若能指出区域请描述>
 
-    {few_shot_examples}
+    （如同时提供了 few-shot 示例，请参考示例口径，但只对 #1..#K 输出结论）

@@ -194,3 +194,206 @@ def slice_image(image_path: str, slice_size: int, slice_overlap: int, out_dir: s
     except Exception as e:
         print(f"[ERR] 切图失败：{image_path} -> {e}")
         return []
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def _load_sidecar_json(json_path: str):
+    try:
+        import json
+        if os.path.isfile(json_path):
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # 兼容 { "boxes": [...] } 或直接 [ ... ]
+            if isinstance(data, dict) and "boxes" in data:
+                return data["boxes"]
+            if isinstance(data, list):
+                return data
+    except Exception as e:
+        print(f"[WARN] 读取 JSON 失败：{json_path} -> {e}")
+    return None
+
+def _load_yolo_txt(txt_path: str, W: int, H: int, normalized: bool = True):
+    """
+    解析 YOLO 格式：每行 'cls cx cy w h'（通常归一化到 0~1）
+    返回 list[dict(x1,y1,x2,y2,label)]
+    """
+    boxes = []
+    if not os.path.isfile(txt_path):
+        return boxes
+    try:
+        with open(txt_path, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                parts = ln.split()
+                if len(parts) < 5:
+                    continue
+                cls = parts[0]
+                cx, cy, ww, hh = map(float, parts[1:5])
+                if normalized:
+                    cx *= W; cy *= H; ww *= W; hh *= H
+                x1 = cx - ww / 2.0
+                y1 = cy - hh / 2.0
+                x2 = cx + ww / 2.0
+                y2 = cy + hh / 2.0
+                x1 = _clamp(int(round(x1)), 0, W - 1)
+                y1 = _clamp(int(round(y1)), 0, H - 1)
+                x2 = _clamp(int(round(x2)), 0, W - 1)
+                y2 = _clamp(int(round(y2)), 0, H - 1)
+                if x2 > x1 and y2 > y1:
+                    boxes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "label": str(cls)})
+    except Exception as e:
+        print(f"[WARN] 读取 YOLO 标注失败：{txt_path} -> {e}")
+    return boxes
+
+def _normalize_boxes(raw_boxes, W: int, H: int, assume_normalized: Optional[bool]) -> list:
+    """
+    接受以下任意形态：
+      - [ [x1,y1,x2,y2], ... ]
+      - [ {"x1":..,"y1":..,"x2":..,"y2":..,"label"?:..}, ... ]
+      - 允许 0~1 归一化；若未显式指明，则做一个“<=1 判定”的保守推断
+    """
+    out = []
+    if not raw_boxes:
+        return out
+    def _is_norm_candidate(vals):
+        try:
+            return all(0.0 <= float(v) <= 1.0 for v in vals)
+        except Exception:
+            return False
+
+    for b in raw_boxes:
+        if isinstance(b, dict):
+            x1, y1, x2, y2 = b.get("x1"), b.get("y1"), b.get("x2"), b.get("y2")
+            label = b.get("label")
+        else:
+            x1, y1, x2, y2 = b[:4]
+            label = None
+
+        # 判定是否归一化
+        is_norm = False
+        if assume_normalized is not None:
+            is_norm = bool(assume_normalized)
+        else:
+            try:
+                is_norm = _is_norm_candidate([x1, y1, x2, y2])
+            except Exception:
+                is_norm = False
+
+        try:
+            x1 = float(x1); y1 = float(y1); x2 = float(x2); y2 = float(y2)
+            if is_norm:
+                x1 *= W; y1 *= H; x2 *= W; y2 *= H
+            x1 = _clamp(int(round(x1)), 0, W - 1)
+            y1 = _clamp(int(round(y1)), 0, H - 1)
+            x2 = _clamp(int(round(x2)), 0, W - 1)
+            y2 = _clamp(int(round(y2)), 0, H - 1)
+            if x2 > x1 and y2 > y1:
+                out.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "label": label})
+        except Exception:
+            continue
+    return out
+
+def add_bbox_to_image(
+    image_path: str,
+    output_path: str,
+    bbox_settings: Optional[dict] = None
+) -> str:
+    """
+    在图上把候选框画出来，并保存到 output_path；失败时回退返回原图路径。
+    bbox_settings 可用字段（都可选）：
+      # 1) 直接给框（像素或 0~1 归一化）
+      boxes: [ [x1,y1,x2,y2], ... ] 或 [ {x1,y1,x2,y2,label?}, ... ]
+      boxes_normalized: true/false   # 若省略则自动判断是否归一化
+
+      # 2) YOLO 旁文件
+      labels_dir: "/path/to/labels"  # 查找 basename(image).txt
+      yolo_normalized: true          # 默认 true
+
+      # 3) 简单 JSON 旁文件
+      annotations_dir: "/path/to/jsons"  # 查找 basename(image).bboxes.json
+
+      # 可视化样式
+      color: "red"           # 或 "#RRGGBB"
+      line_width: 3
+      show_label: true
+      fill_alpha: 0          # 0=不填充；(0,255] 越大越不透明
+      label_bg_alpha: 160    # 标签底色透明度
+    """
+    try:
+        settings = dict(bbox_settings or {})
+        with Image.open(image_path) as im:
+            im = im.convert("RGBA")
+            W, H = im.size
+
+            # 1) 聚合框源
+            boxes = []
+            # 1.1 inline boxes
+            if "boxes" in settings and settings["boxes"]:
+                boxes = _normalize_boxes(settings["boxes"], W, H, settings.get("boxes_normalized"))
+
+            # 1.2 YOLO
+            if not boxes and settings.get("labels_dir"):
+                stem = os.path.splitext(os.path.basename(image_path))[0]
+                yolo_path = os.path.join(settings["labels_dir"], f"{stem}.txt")
+                boxes = _load_yolo_txt(yolo_path, W, H, normalized=bool(settings.get("yolo_normalized", True)))
+
+            # 1.3 简单 JSON
+            if not boxes and settings.get("annotations_dir"):
+                stem = os.path.splitext(os.path.basename(image_path))[0]
+                json_path = os.path.join(settings["annotations_dir"], f"{stem}.bboxes.json")
+                raw = _load_sidecar_json(json_path)
+                if raw:
+                    boxes = _normalize_boxes(raw, W, H, settings.get("boxes_normalized"))
+
+            if not boxes:
+                # 没有框就直接把原图拷贝/另存，返回原图也行
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                im.convert("RGB").save(output_path)
+                return output_path
+
+            # 2) 画框
+            color = settings.get("color", "red")
+            lw = int(settings.get("line_width", 3))
+            show_label = bool(settings.get("show_label", True))
+            fill_alpha = int(settings.get("fill_alpha", 0))
+            label_bg_alpha = int(settings.get("label_bg_alpha", 160))
+
+            overlay = Image.new("RGBA", im.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+
+            # 字体尝试：找不到系统字体时，用默认
+            try:
+                font = ImageFont.truetype("arial.ttf", size=14)
+            except Exception:
+                font = ImageFont.load_default()
+
+            for b in boxes:
+                x1, y1, x2, y2 = b["x1"], b["y1"], b["x2"], b["y2"]
+                # 可选填充
+                if fill_alpha > 0:
+                    draw.rectangle([(x1, y1), (x2, y2)], fill=(255, 0, 0, _clamp(fill_alpha, 0, 255)))
+                # 轮廓
+                for k in range(max(1, lw)):
+                    draw.rectangle([(x1 - k, y1 - k), (x2 + k, y2 + k)], outline=color)
+                # 标签
+                if show_label and b.get("label"):
+                    label = str(b["label"])
+                    tw, th = draw.textsize(label, font=font)
+                    pad = 2
+                    bx2 = _clamp(x1 + tw + 2 * pad, 0, W)
+                    by2 = _clamp(y1 + th + 2 * pad, 0, H)
+                    # 底色
+                    draw.rectangle([(x1, y1), (bx2, by2)], fill=(0, 0, 0, _clamp(label_bg_alpha, 0, 255)))
+                    draw.text((x1 + pad, y1 + pad), label, fill=(255, 255, 255, 255), font=font)
+
+            out = Image.alpha_composite(im, overlay).convert("RGB")
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            out.save(output_path)
+            return output_path
+    except Exception as e:
+        print(f"[ERR] add_bbox_to_image 失败：{image_path} -> {e}")
+        # 回退：用原图
+        return image_path

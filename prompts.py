@@ -1,76 +1,85 @@
 # prompts.py
 # -*- coding: utf-8 -*-
 """
-Prompt builders for Qwen-VL anomaly detection with LLaMA-Factory.
+Prompt builders for Qwen-VL anomaly detection.
 
-- Integrated (ChatModel) mode:
-    * Use build_text_prompt(...) to get the text prompt (NO <image> token).
-    * Pass images as a separate list to ChatModel.stream_chat(..., images=images).
-
-- API (OpenAI-style) mode:
-    * Use build_api_messages(...) to get messages, where content is a list of
-      {"type":"text"} / {"type":"image_url"} blocks.
-
-Refs:
-- Official API example uses image_url blocks (scripts/api_example/test_image.py).
-- Chat engine signature shows images passed separately to stream_chat(..., images,...).
+要点：
+- 文本只负责“话术”，不放图片占位符。
+- 图片（few-shot + 待测）由上层以列表形式传入推理引擎。
+- 如走 OpenAI 兼容 API，可用 build_api_messages 构造 blocks。
 """
 from __future__ import annotations
-
 import base64
 from io import BytesIO
 from pathlib import Path
-from typing import List, Tuple, Sequence, Optional, Union
-
+from typing import List, Tuple, Sequence, Optional, Union, Dict
 from PIL import Image
 
 # ----------------------------
-# Few-shot 文本块（不插入图片占位符）
+# Few-shot 文本块（仅文字说明）
 # ----------------------------
-def build_few_shot_examples_text(example_images: List[Tuple[str, str]]) -> str:
+def build_few_shot_examples_text(example_images: List[Tuple[str, str]],
+                                 show_label: bool = True) -> str:
     """
-    :param example_images: [(img_path, label)], label: 'p'异常 / 'n'正常
+    :param example_images: [(img_path, label)], label: 'p'(异常) / 'n'(正常) / 其它
     :return: 多个示例的文本描述（不包含图片占位符）
     """
+    if not example_images:
+        return "（示例图像见上）"
     parts: List[str] = []
     for i, (_img, label) in enumerate(example_images, start=1):
-        status = "异常" if label == "p" else "正常"
-        if status == "异常":
+        if show_label and label in ("p", "n"):
+            status = "异常" if label == "p" else "正常"
             parts.append(
-                f"示例 {i}（异常）\n"
-                f"【判断】: 异常\n"
-                f"【分析】: 图片中存在结构性缺陷（裂缝/渗水/破损等）。\n"
+                f"示例 {i}（{status}）\n"
+                f"【判断】: {status}\n"
+                f"【分析】: 请参考上方示例图像中的关键区域与纹理特征。\n"
             )
         else:
-            parts.append(
-                f"示例 {i}（正常）\n"
-                f"【判断】: 正常\n"
-                f"【分析】: 衬砌板表面完整，无明显缺陷。\n"
-            )
+            parts.append(f"示例 {i}\n【提示】: 参考上方示例图像。")
     return "\n".join(parts).strip()
-
 
 # ----------------------------
 # 模板渲染（只负责文本）
 # ----------------------------
+# prompts.py（只贴需要替换的函数）
+from typing import List, Tuple, Optional, Dict
+
+def build_few_shot_examples_text(example_images: List[Tuple[str, str]],
+                                 show_label: bool = True) -> str:
+    if not example_images:
+        return "（示例图像见上）"
+    parts = []
+    for i, (_img, label) in enumerate(example_images, start=1):
+        tag = "异常" if (show_label and label == "p") else ("正常" if (show_label and label == "n") else "")
+        head = f"示例#{i}" + (f"（{tag}）" if tag else "")
+        parts.append(f"{head}\n【提示】: 参考上方示例图像。")
+    return "\n".join(parts).strip()
+
 def build_text_prompt(
     prompt_template: str,
     few_shot_examples: Optional[List[Tuple[str, str]]] = None,
+    show_fewshot_label: bool = True,
+    placeholders: Optional[Dict[str, str]] = None
 ) -> str:
-    """
-    渲染配置里的 prompt 模板，只产出【文本】。
-    注意：不再使用 <image> 占位符，图片由上层分别传入（集成模式：images参数；API模式：image_url分块）。
+    text = (prompt_template or "").strip()
+    if not text:
+        return ""
 
-    可用占位符：
-      - {few_shot_examples}（可选）
-
-    """
-    text = prompt_template
+    # few-shot 占位
     if "{few_shot_examples}" in text:
-        if not few_shot_examples:
-            raise ValueError("该模板需要 few_shot_examples，但未提供。")
-        ex = build_few_shot_examples_text(few_shot_examples)
+        ex = build_few_shot_examples_text(few_shot_examples or [], show_fewshot_label)
         text = text.replace("{few_shot_examples}", ex)
+
+    # 其它占位（例如 {image_order_hint}）
+    for k, v in (placeholders or {}).items():
+        token = "{" + k + "}"
+        if token in text:
+            text = text.replace(token, v or "")
+
+    # 清除遗留占位
+    if "<image>" in text or "{image_token}" in text:
+        text = text.replace("<image>", "").replace("{image_token}", "")
     return text
 
 
@@ -89,19 +98,15 @@ def _path_to_data_uri(path: Union[str, Path]) -> str:
         mime = "jpeg" if fmt in {"JPG", "JPEG"} else fmt.lower()
         return f"data:image/{mime};base64,{b64}"
 
-
 def _to_image_url_block(url_or_path: str) -> dict:
     """
-    输入可以是 http(s) 链接，也可以是本地路径。
-    - http(s) 直接作为 url 传递；
-    - 本地路径会被转为 data URI，兼容官方 API 结构。
+    输入可以是 http(s) 链接，也可以是本地路径（将被转为 data URI）。
     """
-    if url_or_path.startswith("http://") or url_or_path.startswith("https://") or url_or_path.startswith("data:"):
+    if url_or_path.startswith(("http://", "https://", "data:")):
         url = url_or_path
     else:
         url = _path_to_data_uri(url_or_path)
     return {"type": "image_url", "image_url": {"url": url}}
-
 
 # ----------------------------
 # API 模式：构造 OpenAI Chat Completions 的 messages
@@ -113,14 +118,7 @@ def build_api_messages(
 ) -> List[dict]:
     """
     生成 OpenAI 风格的 messages：
-      [
-        {"role": "system", "content": "..."}?,            # 可选
-        {"role": "user",   "content": [text_block, img_block, ...]}
-      ]
-
-    :param prompt_text: 渲染完成的文本提示词（build_text_prompt 的结果）
-    :param image_list:  图片路径或 URL（按你希望模型看到的顺序）
-    :param system_text: 可选，system 指令
+      [{"role":"system","content":"..."}?, {"role":"user","content":[text_block, img_block, ...]}]
     """
     content_blocks: List[dict] = [{"type": "text", "text": prompt_text}]
     for p in image_list:
@@ -132,54 +130,12 @@ def build_api_messages(
     messages.append({"role": "user", "content": content_blocks})
     return messages
 
-
 # ----------------------------
-# 集成模式（ChatModel）用：只返回 messages 文本，图片另行传参
+# 集成模式（ChatModel）：只返回文本 messages；图片另行传参
 # ----------------------------
 def build_integrated_messages(prompt_text: str, system_text: Optional[str] = None) -> List[dict]:
-    """
-    ChatModel.stream_chat(...) 期望：
-      - messages: 纯文本对话列表
-      - images:   单独的图片列表参数（由调用方传入）
-    """
     messages: List[dict] = []
     if system_text:
         messages.append({"role": "system", "content": system_text})
     messages.append({"role": "user", "content": prompt_text})
     return messages
-# -*- coding: utf-8 -*-
-
-# -*- coding: utf-8 -*-
-from typing import List, Optional, Tuple
-
-def _render_few_shot_text(examples: List[Tuple[str, str]], show_label: bool) -> str:
-    """
-    将 few-shot 的 (path,label) 列表转为简短文字占位，提示模型“上方有示例图像”。
-    label: 'n'/'p'/'unknown'
-    show_label: 为 True 时会在文本里提示参考判定；为 False 时不泄露标签。
-    """
-    if not examples:
-        return "（示例图像见上）"
-    lines = []
-    for i, (_, lb) in enumerate(examples, 1):
-        if show_label and lb in ("n", "p"):
-            hint = "（参考判定：异常）" if lb == "p" else "（参考判定：正常）"
-        else:
-            hint = ""
-        lines.append(f"[示例{i}] 图像见上{hint}")
-    return "\n".join(lines)
-
-def build_text_prompt(prompt_template: str,
-                      few_shot_examples: Optional[List[Tuple[str, str]]] = None,
-                      show_fewshot_label: bool = True) -> str:
-    """
-    用模板 + 可选 few-shot 文本块生成最终文本提示词。
-    模板里如包含 {few_shot_examples} 占位符则会被替换。
-    """
-    if not prompt_template:
-        return ""
-    if "{few_shot_examples}" in prompt_template:
-        ex_text = _render_few_shot_text(few_shot_examples or [], show_fewshot_label)
-        return prompt_template.replace("{few_shot_examples}", ex_text)
-    return prompt_template
-
