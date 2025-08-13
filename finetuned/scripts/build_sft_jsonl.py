@@ -18,7 +18,12 @@ def regions_to_text(regions, include_label=False):
     lines.append("</regions>")
     return "\n".join(lines)
 
-import random
+def _part_text(s: str):
+    return {"type":"text","text": s, "image": None}
+
+def _part_image(path: str):
+    # 这里只存路径，真正的 PIL 加载在 collator 里做
+    return {"type":"image","text": None, "image": path}
 
 def main():
     ap = argparse.ArgumentParser()
@@ -35,14 +40,14 @@ def main():
             it = json.loads(line)
             regions = it["regions"]
             pos_ids = set(it.get("positive_region_ids", []))
-            # user content：文本+图片
+
             reg_text = regions_to_text(regions, include_label=args.include_label)
             user_content = [
-                {"type":"text","text":"请在候选区域内判断是否存在异常，并返回结构化JSON。"},
-                {"type":"text","text":reg_text},
-                {"type":"image","image": it["image"]}
+                _part_text("请在候选区域内判断是否存在异常，并返回结构化JSON。"),
+                _part_text(reg_text),
+                _part_image(it["image"])
             ]
-            # assistant 期望
+
             per_region = []
             for r in regions:
                 rid = r["id"]
@@ -57,12 +62,13 @@ def main():
                     item["type"] = r["label"]
                 per_region.append(item)
             assistant_json = {"per_region": per_region, "image_level": it.get("image_level","正常")}
+            assistant_text = json.dumps(assistant_json, ensure_ascii=False)
 
             rec = {
                 "messages": [
-                    {"role":"system","content": SYSTEM_PROMPT},
-                    {"role":"user","content": user_content},
-                    {"role":"assistant","content": json.dumps(assistant_json, ensure_ascii=False)}
+                    {"role":"system",   "content":[_part_text(SYSTEM_PROMPT)]},
+                    {"role":"user",     "content": user_content},
+                    {"role":"assistant","content":[_part_text(assistant_text)]}
                 ]
             }
             g.write(json.dumps(rec, ensure_ascii=False)+"\n")

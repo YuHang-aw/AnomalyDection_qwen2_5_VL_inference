@@ -8,42 +8,49 @@ from transformers import TrainingArguments, Trainer
 from transformers.trainer_utils import EvalPrediction
 
 from src.modeling.load_qwen_vl import load_model_and_processor, apply_freeze_and_lora
+from datasets import load_dataset, Features, Sequence, Value
+
+features = Features({
+    "messages": Sequence({
+        "role": Value("string"),
+        "content": Sequence({
+            "type":  Value("string"),
+            "text":  Value("string"),  # 允许为 None
+            "image": Value("string"),  # 允许为 None（仅保存路径）
+        })
+    })
+})
+
 
 # 简易collator：每步用processor把 messages+image 打成模型需要的 tensors
 class VLDataCollator:
     def __init__(self, processor, max_length=4096):
         self.processor = processor
         self.max_length = max_length
+
     def __call__(self, examples):
-        images = []
         chats = []
+        from PIL import Image
+
         for ex in examples:
-            msgs = ex["messages"]
-            img_path = None
-            # 将 user 的 image 路径替换为 PIL 对象，传给processor
             mm_msgs = []
-            for m in msgs:
-                if m["role"] == "user":
-                    parts = []
-                    for c in m["content"]:
-                        if c["type"] == "image":
-                            img_path = c["image"]
-                            from PIL import Image
-                            img = Image.open(img_path).convert("RGB")
-                            parts.append({"type":"image","image": img})
-                        else:
-                            parts.append(c)
-                    mm_msgs.append({"role":"user","content":parts})
-                else:
-                    mm_msgs.append(m)
+            for m in ex["messages"]:
+                parts_out = []
+                for p in m["content"]:
+                    if p["type"] == "image":
+                        # 把路径 -> PIL，供 processor 使用
+                        img = Image.open(p["image"]).convert("RGB")
+                        parts_out.append({"type":"image","image": img, "text": None})
+                    else:
+                        parts_out.append({"type":"text","text": p.get("text") or "", "image": None})
+                mm_msgs.append({"role": m["role"], "content": parts_out})
             chats.append(mm_msgs)
+
         batch = self.processor.apply_chat_template(
             chats, add_generation_prompt=False, tokenize=True, return_tensors="pt"
         )
-        # 图像tensor
-        # 大多数Qwen处理器会在上面一步同时处理图像；若没有，可额外：
-        # pixel = self.processor(images=images, return_tensors="pt")
         return batch
+
 
 
 def main():
@@ -57,8 +64,8 @@ def main():
         cfg = yaml.safe_load(f)
 
     # 数据
-    train_ds = load_dataset("json", data_files=cfg["data"]["train_jsonl"], split="train")
-    val_ds   = load_dataset("json", data_files=cfg["data"]["val_jsonl"],   split="train")
+    train_ds = load_dataset("json", data_files=cfg["data"]["train_jsonl"], split="train", features=features)
+    val_ds   = load_dataset("json", data_files=cfg["data"]["val_jsonl"],   split="train", features=features)
 
     # 模型+处理器
     model, processor = load_model_and_processor(cfg)
