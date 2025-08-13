@@ -1,0 +1,167 @@
+# 0) 环境就绪（一次性）
+```bash
+# 建议新建虚拟环境
+python -m venv .venv && source .venv/bin/activate   # Windows 用 .venv\Scripts\activate
+
+pip install -U "transformers>=4.41" "datasets>=2.19" "peft>=0.11" accelerate
+pip install pyyaml pillow
+```
+
+---
+
+# 1) 放好数据 & 配好 `configs/data.yaml`
+目录结构：
+```
+data/
+  abnormal_root/   # 异常图（每张旁边有同名 .txt）
+  normal_root/     # 正常图（无txt）
+```
+
+关键配置（已帮你处理“全角分号；/半角; 混用 & 第二列多框”）：
+```yaml
+# configs/data.yaml
+abnormal_dir: ./data/abnormal_root
+normal_dir:   ./data/normal_root
+out_dir:      ./data/prepared
+
+seed: 42
+train_ratio: 0.8
+val_ratio:   0.1
+test_ratio:  0.1
+split_by_parent: true          # 尽量把同一父文件夹的图放同一子集（防泄漏）
+holdout_list: []               # 想“偷偷”抽走的特定图片名写这里（强制进test）
+
+min_box_size: 24
+max_boxes_per_image: 8
+abnormal_neg_per_pos: 1        # 异常图：每个正框配1个负框（1:1）
+normal_decoys_per_image: 6     # 正常图：每图放6个干扰框
+
+# 你的TXT行是：文件名 ; 坐标域 ; 缺陷类型
+column_delim: ";"
+inner_coord_delims: ["；",";","，",","," "]  # 坐标域里各种分隔符都吃
+coords_are_xyxy: true                         # 第二列是 x1,y1,x2,y2（像 1190；206；1712；377 ...）
+label_map:
+  crack: 裂缝
+  seepage: 渗漏
+  spall: 掉块
+```
+
+> 想要“偷偷切几张图片出去”做盲测：把这些文件名（不含路径）填到 `holdout_list`，例如：
+> ```yaml
+> holdout_list: ["IMG_0123.jpg","S3_045.png"]
+> ```
+
+---
+
+# 2) 第一步：切分并生成候选框（train/val/test 三分）
+```bash
+python scripts/prepare_regions.py --config configs/data.yaml
+# 输出：
+# data/prepared/regions_train.jsonl
+# data/prepared/regions_val.jsonl
+# data/prepared/regions_test.jsonl
+```
+
+---
+
+# 3) 第二步：构建多模态SFT样本（messages 结构，禁止“红框/颜色”泄漏）
+```bash
+python scripts/build_sft_jsonl.py \
+  --regions_jsonl ./data/prepared/regions_train.jsonl \
+  --out_jsonl     ./data/prepared/sft_train.jsonl
+
+python scripts/build_sft_jsonl.py \
+  --regions_jsonl ./data/prepared/regions_val.jsonl \
+  --out_jsonl     ./data/prepared/sft_val.jsonl
+
+# 这份先留着做最终盲测，别参加训练
+python scripts/build_sft_jsonl.py \
+  --regions_jsonl ./data/prepared/regions_test.jsonl \
+  --out_jsonl     ./data/prepared/sft_test.jsonl
+```
+
+（可选）快速抽样检查一下生成是否正确：
+```bash
+python scripts/preview_sample.py  # 如果你要的话我再给一个小脚本打印前2条 messages
+```
+
+---
+
+# 4) 第三步：开训（Phase-1：冻结视觉塔，只训 projector + 语言侧 LoRA）
+确认 `configs/train_phase1.yaml` 已按我给你的那版（含最优ckpt保存）——然后：
+```bash
+python scripts/train.py --train_config configs/train_phase1.yaml
+```
+
+- 中断了想续训：
+```bash
+python scripts/train.py --train_config configs/train_phase1.yaml --resume
+```
+
+训练结束后，最好的 checkpoint 会自动被还原到内存；磁盘上保留：
+```
+runs/phase1/
+  checkpoint-XXXX/
+    adapter_config.json
+    adapter_model.safetensors  # ← LoRA/QLoRA 权重
+  ...
+```
+
+---
+
+# 5)（可选）Phase-2/Phase-3（逐步“加点视觉”）
+觉得 Phase-1 的 ROI F1 还不够，再跑：
+```bash
+# 顶层4个视觉block上LoRA（小学习率）
+python scripts/train.py --train_config configs/train_phase2.yaml
+
+# 进一步小步长解冻最顶2个视觉block
+python scripts/train.py --train_config configs/train_phase3.yaml
+```
+> 每一相都各自产生自己的 runs 目录，互不覆盖。
+
+---
+
+# 6) 盲测（防泄漏 test 集）
+你可以写个很短的推理脚本，载入 **基座模型 + LoRA 适配器**，对 `sft_test.jsonl` 逐条跑生成并算指标。示例加载方式（放到你的上个项目里）：
+
+```python
+from transformers import AutoProcessor, AutoModelForCausalLM  # 或 Vision2Seq，按你基座而定
+from peft import PeftModel
+import torch, json
+
+base = "Qwen/Qwen2.5-VL-7B-Instruct"
+ckpt = "runs/phase1/checkpoint-XXXX"   # 选最好的那个
+
+processor = AutoProcessor.from_pretrained(base, trust_remote_code=True)
+base_model = AutoModelForCausalLM.from_pretrained(
+    base, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
+)
+model = PeftModel.from_pretrained(base_model, ckpt)
+
+model.eval()
+# 读取 data/prepared/sft_test.jsonl，逐条把 user messages 喂进去做生成即可
+```
+
+---
+
+# 7) 常用变体参数（现场改动就这几个）
+- 正常图的干扰框数量：`normal_decoys_per_image`（默认 6）
+- 每图候选上限：`max_boxes_per_image`（默认 8）
+- 1:1 配比：`abnormal_neg_per_pos: 1`
+- 盲测比例：`test_ratio` 或 `holdout_list`
+
+---
+
+# 8) 快速排错
+- 坐标解析报错/框数异常：基本都是第二列分隔符问题；`inner_coord_delims` 里保证有 `["；",";","，",","," "]` 即可。  
+- “提示模板不吃 messages”：Qwen2.5-VL 的 processor 版本差异大，若 `apply_chat_template` 报错，打印一条样本看看字段名对齐（必要时把图片单独通过 `processor(images=[...])` 喂入）。  
+- 显存不够：把 `peft.qlora=true`，`r` 降到 8/16，开 `optim.grad_checkpointing=true`，或把 `image_short_side` 调成 896/768。  
+
+---
+
+## 一句话总结流程
+**切分与构建候选** → `prepare_regions.py`  
+**转成多模态SFT样本** → `build_sft_jsonl.py`  
+**Phase-1 训练（最优ckpt自动保存）** → `train.py`  
+**盲测（sft_test.jsonl）** → 在你上个项目里加载 **基座 + LoRA** 推理
