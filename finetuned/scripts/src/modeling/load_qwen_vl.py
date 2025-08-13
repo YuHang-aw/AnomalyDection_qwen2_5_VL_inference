@@ -4,16 +4,33 @@ from transformers import AutoProcessor, AutoModelForVision2Seq
 
 # 说明：不同版本的Qwen2.5-VL在HF类名可能略有差异，如遇问题可切换到AutoModelForCausalLM或官方类。
 
-def load_model_and_processor(cfg: Dict[str, Any]):
-    name = cfg["model_name"]
-    proc = AutoProcessor.from_pretrained(name, trust_remote_code=True)
-    model = AutoModelForVision2Seq.from_pretrained(
-        name,
-        torch_dtype=("bf16"),
-        trust_remote_code=True,
-        device_map="auto"
+from transformers import AutoProcessor, AutoModelForVision2Seq
+
+def load_model_and_processor(cfg):
+    name = cfg["model_name"]  # 本地路径
+    proc = AutoProcessor.from_pretrained(
+        name, trust_remote_code=True, local_files_only=True
     )
+    try:
+        model = AutoModelForVision2Seq.from_pretrained(
+            name,
+            torch_dtype="bfloat16",
+            trust_remote_code=True,
+            local_files_only=True,
+            device_map="auto",
+        )
+    except Exception:
+        # 少数版本用 CausalLM 也能跑
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(
+            name,
+            torch_dtype="bfloat16",
+            trust_remote_code=True,
+            local_files_only=True,
+            device_map="auto",
+        )
     return model, proc
+
 
 # 冻结/LoRA注入（按phase配置）
 
