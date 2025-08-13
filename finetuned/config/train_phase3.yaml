@@ -1,0 +1,9 @@
+_base_: configs/train_phase2.yaml
+output_dir: ./runs/phase3
+freeze:
+  vision_tower: partial_unfreeze
+vision:
+  top_blocks_unfreeze: 2     # 只解冻最顶2个block
+optim:
+  lr_vision_unfrozen: 1.0e-5
+  epochs: 1

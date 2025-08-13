@@ -1,0 +1,44 @@
+model_name: Qwen/Qwen2.5-VL-7B-Instruct
+output_dir: ./runs/phase1
+precision: bf16
+image_short_side: 1024
+max_regions_per_image: 8
+
+peft:
+  enable: true
+  qlora: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj","mm_projector"]
+
+freeze:
+  vision_tower: true
+  projector: false
+  language: lora_only
+
+optim:
+  lr_lm: 1.0e-4
+  lr_proj: 2.0e-4
+  batch_size: 1
+  grad_accum: 8
+  epochs: 2
+  warmup_steps: 200
+  weight_decay: 0.01
+  grad_checkpointing: true
+
+data:
+  train_jsonl: ./data/prepared/sft_train.jsonl
+  val_jsonl:   ./data/prepared/sft_val.jsonl
+
+trainer:
+  save_strategy: steps      # 或 "epoch"
+  save_steps: 200
+  evaluation_strategy: steps
+  eval_steps: 200
+  logging_steps: 50
+  save_total_limit: 3
+  load_best_model_at_end: true
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  save_safetensors: true

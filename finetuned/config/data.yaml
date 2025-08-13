@@ -1,0 +1,31 @@
+# --- 路径 ---
+abnormal_dir: ./data/abnormal_root     # 异常图目录（每张有同名 .txt）
+normal_dir:   ./data/normal_root       # 正常图目录（无标注）
+out_dir:      ./data/prepared
+
+# --- 划分 ---
+seed: 42
+train_ratio: 0.8
+val_ratio:   0.1
+test_ratio:  0.1
+split_by_parent: true        # true=按父目录分组（同一文件夹不被拆开到不同子集）
+holdout_list: []             # 可填若干文件名（不含路径）强制进 test，例如: ["IMG_00123.jpg","S3_045.png"]
+
+# --- 候选框与采样 ---
+min_box_size: 24             # 像素，小于则丢弃
+max_boxes_per_image: 8       # 每图最多K个候选（推理速度友好）
+abnormal_neg_per_pos: 1      # 异常图：每个正ROI配几个负ROI（1:1）
+normal_decoys_per_image: 6   # 正常图：随机干扰框数量（可调）
+
+# --- TXT解析（关键！）---
+txt_format: "per_image"      # 你现在是每图一个txt
+column_delim: ";"            # 三列之间用分号 ; 分隔（注意：第二列内部也可能有分号）
+inner_coord_delims: ["；",";","，",","," "]  # 第二列内部允许的数值分隔符（含全角分号）
+coords_are_xyxy: true        # 第二列的坐标是 x1,y1,x2,y2；若是 cx,cy,w,h 则设为 false
+# 多框情况：第二列可能是“1190；206；1712；377 1813；555；1866；636”，我们会把所有数字按 4 个一组切成多个框
+
+# --- 标签映射（可选）---
+label_map:
+  crack: 裂缝
+  seepage: 渗漏
+  spall: 掉块
