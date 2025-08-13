@@ -2,10 +2,6 @@ from typing import Dict, Any
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoProcessor, AutoModelForVision2Seq
 
-# 说明：不同版本的Qwen2.5-VL在HF类名可能略有差异，如遇问题可切换到AutoModelForCausalLM或官方类。
-
-from transformers import AutoProcessor, AutoModelForVision2Seq
-
 def load_model_and_processor(cfg):
     name = cfg["model_name"]  # 本地路径
     proc = AutoProcessor.from_pretrained(
@@ -34,41 +30,47 @@ def load_model_and_processor(cfg):
 
 # 冻结/LoRA注入（按phase配置）
 
-def apply_freeze_and_lora(model, cfg: Dict[str, Any]):
-    # 冻结视觉塔
-    if cfg.get("freeze",{}).get("vision_tower", False) is True:
-        if hasattr(model, "vision_tower"):
-            for p in model.vision_tower.parameters():
-                p.requires_grad = False
-    elif cfg.get("freeze",{}).get("vision_tower") == "partial_unfreeze":
-        # 仅示例：顶层block可通过名字匹配（需根据实际命名调整）
-        top_n = int(cfg.get("vision",{}).get("top_blocks_unfreeze", 0))
-        if hasattr(model, "vision_tower") and top_n>0:
-            # 假设 model.vision_tower.blocks 是列表（具体按模型实现适配）
-            blocks = getattr(model.vision_tower, "blocks", [])
-            keep = set(id(b) for b in blocks[-top_n:])
-            for b in blocks:
-                req = (id(b) in keep)
-                for p in b.parameters(): p.requires_grad = req
+def apply_freeze_and_lora(model, cfg):
+    peft_cfg = cfg.get("peft", {})
+    qlora = bool(peft_cfg.get("qlora", False))
+    r = int(peft_cfg.get("r", 16))
+    alpha = int(peft_cfg.get("alpha", 32))
+    dropout = float(peft_cfg.get("dropout", 0.05))
 
-    # Projector 冻结与否
-    if cfg.get("freeze",{}).get("projector", False):
-        if hasattr(model, "mm_projector"):
-            for p in model.mm_projector.parameters(): p.requires_grad = False
-
-    # 语言侧控制："lora_only" 表示仅LoRA权重训练
-    # LoRA 配置
-    pconf = cfg.get("peft", {})
-    if pconf.get("enable", False):
-        if pconf.get("qlora", False):
-            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=cfg.get("optim",{}).get("grad_checkpointing", False))
-        target = pconf.get("target_modules", [])
-        lconf = LoraConfig(
-            r=int(pconf.get("r",16)),
-            lora_alpha=int(pconf.get("alpha",32)),
-            lora_dropout=float(pconf.get("dropout",0.05)),
-            target_modules=target,
-            bias="none"
+    # 1) QLoRA 前置准备（4-bit/8-bit 才需要）
+    if qlora:
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=cfg["optim"].get("grad_checkpointing", False)
         )
-        model = get_peft_model(model, lconf)
+
+    # 2) 先把全模型冻结（LoRA 是新加的、默认可训练）
+    for n, p in model.named_parameters():
+        p.requires_grad = False
+
+    # 3) 插入 LoRA —— 只命中语言侧线性层；需要再训 projector 的话额外解冻
+    target = peft_cfg.get("target_modules", [
+        "q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"
+    ])
+    lconf = LoraConfig(
+        r=r, lora_alpha=alpha, lora_dropout=dropout,
+        target_modules=target,
+        bias="none", task_type="CAUSAL_LM"
+    )
+    model = get_peft_model(model, lconf)
+
+    # 4) （可选）解冻多模态投影/视觉侧
+    if cfg.get("train_projector", False):
+        for n, p in model.named_parameters():
+            if "mm_projector" in n:
+                p.requires_grad = True
+
+    # 5) 开启梯度检查点（若需要）
+    if cfg["optim"].get("grad_checkpointing", False):
+        model.gradient_checkpointing_enable()
+
+    # 6) 断言：至少有若干参数在训练
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if trainable == 0:
+        raise RuntimeError("No trainable parameters after applying LoRA. Check target_modules / freezing order.")
     return model
