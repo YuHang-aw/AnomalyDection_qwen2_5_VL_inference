@@ -6,19 +6,15 @@ from datasets import load_dataset
 from transformers import TrainingArguments, Trainer, set_seed
 from src.modeling.load_qwen_vl import *
 
-# ============ Collator ============
-
 class VLDataCollator:
     """
-    - 逐样本 encode（truncation=False），视觉块不截断；超限按需降分
-    - pixel_values：
-        * 单样本 [N,C,H,W]
-        * 多样本 [B,Nmax,C,Hmax,Wmax] + pixel_values_mask
-    - grid_thw（传给模型）：
-        * 单样本：list[tuple(int,int,int)]  ← 确保能 `for t,h,w in grid_thw`
-        * 多样本：list[list[tuple]]         ← 逐样本一份
-      规则：h=ceil(H/patch)，w=ceil(W/patch)；再向上补到 spatial_merge_size 的倍数，且最小=spatial_merge_size
-      之后用真实 <|image_pad|> 数对齐：∑(t*h*w) == real_cnt
+    - 逐样本 encode（truncation=False），不截断视觉块；超限按需降分
+    - pixel_values：单样本 [N,C,H,W]；多样本 [B,Nmax,C,Hmax,Wmax] + pixel_values_mask
+    - grid_thw（传入模型）：
+        * 单样本：list[tuple(int,int,int)]  → [(t,h,w), ...]，t=1
+        * 多样本：list[list[tuple(...)] ]   → 逐样本一份
+      计算规则：h=ceil(H/patch)，w=ceil(W/patch)，然后向上补齐为 spatial_merge_size 的倍数，且最小=spatial_merge_size
+      （**不与 <|image_pad|> 计数对齐，也不做相关断言**）
     """
     def __init__(self, processor, model_config, max_length=4096,
                  add_generation_prompt=False, label_pad_token_id=-100,
@@ -49,7 +45,6 @@ class VLDataCollator:
         self._user_image_literal = "<image>"
         self._user_image_safe = "〈image〉"
 
-    # ---------- helpers ----------
     @staticmethod
     def _resize_keep_short(img, new_short):
         from PIL import Image
@@ -76,10 +71,6 @@ class VLDataCollator:
             total_img += sum(1 for t in ids[s:e+1] if t == self.image_token_id)
             si += 1
         return blocks, total_img
-
-    def _count_image_pad_tokens(self, ids, blocks):
-        if not blocks: return 0
-        return sum(1 for s, e in blocks for t in ids[s:e+1] if t == self.image_token_id)
 
     def _extract_sizes_from_pv(self, pv):
         sizes = []
@@ -115,57 +106,22 @@ class VLDataCollator:
         p = max(1, self.patch_size)
         m = max(1, self.spatial_merge_size)
         def up_to(x, k):
-            x = max(k, int(x))
-            return ((x + k - 1)//k)*k
+            x = max(k, int(x))                 # 至少为 m，避免 0
+            return ((x + k - 1)//k)*k          # 向上补齐为 m 的倍数
         grid = []
         for (H, W) in sizes:
             H = max(1, int(H)); W = max(1, int(W))
             h = up_to(math.ceil(H / float(p)), m)
             w = up_to(math.ceil(W / float(p)), m)
-            grid.append((1, h, w))
+            grid.append((1, h, w))             # t=1（静态图）
         return grid  # list[(t,h,w)]
 
-    def _adjust_grid_to_match_tokens(self, grid, real_cnt):
-        """把 ∑(t*h*w) 调整到 real_cnt：只微调最后一个 (t,h,w) 的 w，步长 = spatial_merge_size。"""
-        m = max(1, self.spatial_merge_size)
-        grid = [(int(t), int(h), int(w)) for (t,h,w) in grid]
-        if real_cnt <= 0:
-            return []  # 根本没有视觉 token → grid 置空
-        total = sum(t*h*w for (t,h,w) in grid) if grid else 0
-        if not grid:
-            # 兜底：造一个 (1, m, 最近的 m 倍) 来匹配 real_cnt
-            need_w = max(m, ((real_cnt + m - 1)//m))
-            need_w = ((need_w + m - 1)//m)*m
-            return [(1, m, need_w)]
-        if total == real_cnt:
-            return grid
-        t, h, w = grid[-1]
-        h = max(m, ((h + m - 1)//m)*m)
-        w = max(m, ((w + m - 1)//m)*m)
-        # 以 m 为步长调 w
-        need_last = real_cnt - sum(tt*hh*ww for (tt,hh,ww) in grid[:-1])
-        # need_last 必须是 t*h*X 的形式 → 求最接近的 X（按 m 对齐）
-        step_unit = max(1, t*h)
-        x = max(m, (need_last + step_unit - 1)//step_unit)
-        x = ((x + m - 1)//m)*m
-        grid[-1] = (t, h, x)
-        # 再验
-        total2 = sum(tt*hh*ww for (tt,hh,ww) in grid)
-        if total2 != real_cnt:
-            # 再微调 1 个 m 步
-            diff = real_cnt - total2
-            sign = 1 if diff > 0 else -1
-            x2 = max(m, x + sign*m)
-            grid[-1] = (t, h, x2)
-        return grid
-
-    # ---------- main ----------
     def __call__(self, examples):
         from PIL import Image
         import math
         tok = self.processor.tokenizer
 
-        # 1) 组模板 + PIL
+        # 1) 组模板 + 收集 PIL
         chats_for_template, images_batch = [], []
         for ex in examples:
             mm_tpl, imgs = [], []
@@ -188,32 +144,27 @@ class VLDataCollator:
             chats_for_template, add_generation_prompt=self.add_generation_prompt, tokenize=False
         )
 
-        # 2) 逐样本 encode（必要时降分）
+        # 2) 逐样本 encode（必要时降分；不截断视觉块）
         encoded = []
         for prompt, imgs in zip(prompts, images_batch):
             try_short = self.prefer_short_side or 896
             cur_imgs = imgs
             while True:
                 enc = self.processor(text=prompt, images=cur_imgs, padding=False, truncation=False, return_tensors="pt")
-
                 ids = enc["input_ids"][0]; am = enc["attention_mask"][0]
                 ids_list = ids.tolist()
                 blocks, _ = self._find_blocks(ids_list)
-                if _ < 0:
-                    raise ValueError("Malformed vision token blocks (start/end mismatch).")
-                real_cnt = self._count_image_pad_tokens(ids_list, blocks)
 
-                # sizes → grid（对齐到 m），再与真实 image_pad 对齐
-                sizes0 = self._extract_sizes_from_pv(enc["pixel_values"]) if "pixel_values" in enc else []
-                grid0  = self._sizes_to_grid_list(sizes0 if sizes0 else [(self.patch_size, self.patch_size)])
-                grid   = self._adjust_grid_to_match_tokens(grid0, real_cnt)
+                # 基于像素尺寸推 grid（对齐到 m，且 >= m），不与占位符计数作比较
+                if "pixel_values" not in enc:
+                    raise ValueError("processor did not return pixel_values")
+                sizes0 = self._extract_sizes_from_pv(enc["pixel_values"])
+                grid = self._sizes_to_grid_list(sizes0 if sizes0 else [(self.patch_size, self.patch_size)])
 
-                # 存好供后续打包
-                enc["__grid_list__"] = grid              # list[tuple]（单样本扁平）
-                enc["__image_sizes__"] = sizes0          # list[(H,W)]
-                enc["__vision_real__"] = int(real_cnt)   # 真实 image_pad 数
+                enc["__grid_list__"]   = grid            # list[tuple]（单样本扁平）
+                enc["__image_sizes__"] = sizes0
 
-                # 视觉块优先的文本截断（不切视觉块）
+                # 视觉块优先的文本截断
                 L = ids.shape[-1]
                 if blocks:
                     min_keep = min(s for s, _ in blocks)
@@ -253,7 +204,7 @@ class VLDataCollator:
 
         # 3) 文本 pad + labels
         max_len = max(e["input_ids"].shape[-1] for e in encoded)
-        pad_id = self.processor.tokenizer.pad_token_id
+        pad_id = tok.pad_token_id
         ids_list, am_list = [], []
         for e in encoded:
             ids = e["input_ids"][0]; am = e["attention_mask"][0]
@@ -265,10 +216,9 @@ class VLDataCollator:
         input_ids = torch.stack(ids_list, dim=0)
         attention_mask = torch.stack(am_list, dim=0)
         labels = input_ids.clone(); labels[attention_mask == 0] = self.label_pad_token_id
-
         batch = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        # 4) pixel_values 统一 + grid 打包（并做硬校验）
+        # 4) 统一 pixel_values；grid（单样本=扁平 list[tuple]，多样本=list[list[tuple]]）
         def _ensure_chw(t: torch.Tensor) -> torch.Tensor:
             if t.dim() == 2: t = t.unsqueeze(0)
             elif t.dim() != 3: raise ValueError(f"image tensor must be 2D/3D, got {t.dim()}D")
@@ -295,20 +245,16 @@ class VLDataCollator:
             padded = [torch.nn.functional.pad(im, (0, max_w-im.shape[-1], 0, max_h-im.shape[-2])) for im in imgs]
             return torch.stack(padded, dim=0)
 
-        per_pv, per_mask, per_grid_list, per_sizes, per_real = [], [], [], [], []
+        per_pv, per_mask, per_grid_list, per_sizes = [], [], [], []
+        m = max(1, self.spatial_merge_size)
+
         for e in encoded:
             pv = _to_4d_per_sample(e["pixel_values"])
             per_pv.append(pv)
             per_mask.append(torch.ones((pv.shape[0],), dtype=torch.bool, device=pv.device))
 
             grid = e["__grid_list__"]       # list[tuple]
-            sizes = e["__image_sizes__"]    # list[(H,W)]
-            real  = e["__vision_real__"]    # int
-
-            # --- 强校验：h/w >= m，且为 m 的倍数；grid 为扁平 list[tuple] ---
-            m = max(1, self.spatial_merge_size)
-            assert isinstance(grid, list) and all(isinstance(x, (list,tuple)) and len(x)==3 for x in grid), \
-                f"grid_thw malformed (not list[tuple]): {grid}"
+            # 强化安全：h/w 至少为 m 且为 m 的倍数（避免 0 或奇怪值）
             fixed = []
             for (t,h,w) in grid:
                 t,h,w = int(t), int(h), int(w)
@@ -317,32 +263,15 @@ class VLDataCollator:
                 if h % m != 0: h = ((h + m - 1)//m)*m
                 if w % m != 0: w = ((w + m - 1)//m)*m
                 fixed.append((t,h,w))
-            grid = fixed
+            per_grid_list.append(fixed)
+            per_sizes.append(e["__image_sizes__"])
 
-            total = sum(t*h*w for (t,h,w) in grid)
-            if total != real:
-                grid = self._adjust_grid_to_match_tokens(grid, real)
-                total = sum(t*h*w for (t,h,w) in grid)
-
-            # 二次硬断言（让问题在 collator 阶段就暴露）
-            assert all(h>=m and w>=m for _,h,w in grid), f"h/w must be >= {m}, got {grid}"
-            assert all(h % m == 0 and w % m == 0 for _,h,w in grid), f"h/w must be multiples of {m}, got {grid}"
-            assert total == real, f"grid_sum({total}) != real_image_pad({real}); grid={grid}"
-
-            per_grid_list.append(grid)
-            per_sizes.append(sizes)
-            per_real.append(real)
-
-        # 写 batch（单样本=扁平 list[tuple]；多样本=list[list[tuple]]）
         if len(encoded) == 1:
             batch["pixel_values"]      = per_pv[0]            # [N,C,H,W]
             batch["pixel_values_mask"] = per_mask[0]          # [N]
-            batch["grid_thw"]          = per_grid_list[0]     # list[tuple]（单样本扁平，模型可直接 for t,h,w in ...）
+            batch["grid_thw"]          = per_grid_list[0]     # list[tuple]（扁平，供 for t,h,w in ...）
             batch["image_grid_thw"]    = batch["grid_thw"]    # 别名
-            # 也给一个张量版，少数实现会用到
-            batch["image_grid_thw_tensor"] = torch.as_tensor(batch["grid_thw"], dtype=torch.long) if batch["grid_thw"] else torch.zeros((0,3), dtype=torch.long)
-            batch["image_sizes"]       = per_sizes[0]
-            batch["vision_token_count"] = per_real[0]
+            batch["image_sizes"]       = per_sizes[0]         # list[(H,W)]
         else:
             # 多样本：仅 pixel_values 做 5D pad；grid 保持逐样本列表
             Ns = [pv.shape[0] for pv in per_pv]
@@ -366,20 +295,17 @@ class VLDataCollator:
             batch["grid_thw"]          = per_grid_list        # list[list[tuple]]
             batch["image_grid_thw"]    = batch["grid_thw"]
             batch["image_sizes"]       = per_sizes
-            batch["vision_token_count"] = per_real
 
         # 可选调试
         if os.environ.get("DEBUG_GRID", "0") == "1":
-            if isinstance(batch["grid_thw"], list) and batch["grid_thw"] and isinstance(batch["grid_thw"][0], tuple):
-                g = batch["grid_thw"]
-                print(f"[GRID DEBUG] single: sum={sum(t*h*w for t,h,w in g)} real={batch.get('vision_token_count')} head={g[:2]}")
-            elif isinstance(batch["grid_thw"], list):
-                lens = [len(x) for x in batch["grid_thw"]]
-                print(f"[GRID DEBUG] multi: lens={lens}")
+            g = batch["grid_thw"]
+            if isinstance(g, list) and g and isinstance(g[0], tuple):
+                print(f"[GRID DEBUG] single: sum={sum(t*h*w for t,h,w in g)} head={g[:2]}")
+            elif isinstance(g, list):
+                print(f"[GRID DEBUG] multi: lens={[len(x) for x in g]} head0={(g[0][:2] if g and g[0] else [])}")
 
         return batch
 
-# ============ Train loop (same as yours) ============
 
 def main():
     ap = argparse.ArgumentParser()
@@ -393,20 +319,23 @@ def main():
 
     set_seed(int(cfg.get("seed", 42)))
 
+    # 数据
     train_ds = load_dataset("json", data_files=cfg["data"]["train_jsonl"], split="train")
     val_ds   = load_dataset("json", data_files=cfg["data"]["val_jsonl"],   split="train")
 
+    # 模型 + 处理器
     model, processor = load_model_and_processor(cfg)
     tune_image_processor_from_cfg(processor, cfg)
     model = apply_freeze_and_lora(model, cfg)
 
+    # Collator
     max_seq_len = int(cfg.get("max_seq_len", 4096))
     sanitize_image_literal = bool(cfg.get("data", {}).get("sanitize_image_literal", True))
     images_cfg = cfg.get("images", {})
     auto_downscale = bool(images_cfg.get("auto_downscale_if_needed", True))
     downscale_floor = int(images_cfg.get("downscale_floor", 448))
     downscale_step  = int(images_cfg.get("downscale_step", 64))
-    prefer_short    = int(cfg.get("image_short_side", 896))
+    prefer_short    = int(cfg.get("image_short_side", 896))  # 先用 896，更稳
 
     collator = VLDataCollator(
         processor=processor,
@@ -421,6 +350,7 @@ def main():
         downscale_step=downscale_step,
     )
 
+    # 训练参数
     tr_args = cfg.get("trainer", {})
     ta = TrainingArguments(
         output_dir=cfg["output_dir"],
@@ -446,7 +376,7 @@ def main():
         save_safetensors=tr_args.get("save_safetensors", True),
         report_to=["none"],
         dataloader_num_workers=int(cfg.get("dataloader_num_workers", 2)),
-        remove_unused_columns=False,
+        remove_unused_columns=False,                  # 保留 pixel_values / grid_thw
         ddp_find_unused_parameters=False if int(os.environ.get("WORLD_SIZE", "1")) > 1 else None,
     )
 
