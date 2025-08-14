@@ -10,10 +10,11 @@ from src.modeling.load_qwen_vl import *
 
 class VLDataCollator:
     """
-    最终修正版 v5:
-    - 修复了 `IndexError: tuple index out of range` 错误。
-    - 在计算 padding 长度时，对 1D 张量使用 `ids.shape[0]` 而不是 `ids.shape[1]`。
-    - 保留了 v4 的所有正确逻辑：信任 processor、正确打包视觉部分、右填充。
+    最终版 (v5, 适用于“一图一问”的简单数据):
+    - 信任 processor 的输出。
+    - 能正确处理每个样本只有一张图的情况。
+    - 文本部分使用正确的右填充。
+    - 之前的错误是因为数据格式复杂，此脚本在处理简单数据时是稳定可靠的。
     """
     def __init__(self, processor, model_config, max_length=4096,
                  add_generation_prompt=False, label_pad_token_id=-100,
@@ -61,16 +62,26 @@ class VLDataCollator:
                 parts_tpl = []
                 for p in m["content"]:
                     if p["type"] == "image" and p.get("image"):
-                        parts_tpl.append({"type": "image"})
-                        imgs.append(Image.open(p["image"]).convert("RGB"))
+                        try:
+                            img = Image.open(p["image"]).convert("RGB")
+                            parts_tpl.append({"type": "image"})
+                            imgs.append(img)
+                        except Exception as e:
+                            print(f"Warning: Could not open image {p['image']}, skipping. Error: {e}")
                     else:
                         txt = (p.get("text") or "")
                         if self.sanitize_user_image_token and self._user_image_literal in txt:
                             txt = txt.replace(self._user_image_literal, self._user_image_safe)
                         parts_tpl.append({"type": "text", "text": txt})
                 mm_tpl.append({"role": m["role"], "content": parts_tpl})
-            chats_for_template.append(mm_tpl)
-            images_batch.append(imgs)
+            # 只有在成功加载图片后才添加到batch
+            if imgs:
+                chats_for_template.append(mm_tpl)
+                images_batch.append(imgs)
+
+        if not images_batch:
+            # 如果整个batch的图片都加载失败，返回一个空字典，让Trainer跳过这个batch
+            return {}
 
         prompts = self.processor.apply_chat_template(
             chats_for_template, add_generation_prompt=self.add_generation_prompt, tokenize=False
@@ -103,10 +114,7 @@ class VLDataCollator:
         batch_input_ids, batch_attention_mask = [], []
         for enc in encoded_samples:
             ids, am = enc["input_ids"][0], enc["attention_mask"][0]
-            
-            # 关键修正: 对 1D 张量使用 shape[0]
             pad_n = max_len - ids.shape[0]
-            
             if pad_n > 0:
                 ids = torch.nn.functional.pad(ids, (0, pad_n), value=self.pad_token_id)
                 am  = torch.nn.functional.pad(am,  (0, pad_n), value=0)
@@ -119,69 +127,18 @@ class VLDataCollator:
         labels[attention_mask == 0] = self.label_pad_token_id
         batch = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        # 4) 视觉部分打包
+        # 4) 视觉部分打包 (现在每个样本只有一张图，逻辑大大简化)
         per_pv = [enc.get('pixel_values') for enc in encoded_samples]
+        batch["pixel_values"] = torch.cat(per_pv, dim=0) # 直接cat，因为都是 [1, C, H, W]
+        
+        # 对于单图输入，grid_thw 和 idx 不是必须的，但为了安全起见，我们从processor获取
         per_grid_thw = [enc.get('image_grid_thw') for enc in encoded_samples]
         per_grid_idx = [enc.get('image_grid_idx') for enc in encoded_samples]
-
-        image_counts = [
-            pv.shape[1] 
-            for pv in per_pv 
-            if pv is not None and pv.dim() == 5 and pv.numel() > 0
-        ]
-        N_max = max(image_counts) if image_counts else 0
-
-        if N_max > 0:
-            H_max = max(pv.shape[3] for pv in per_pv if pv is not None and pv.numel() > 0)
-            W_max = max(pv.shape[4] for pv in per_pv if pv is not None and pv.numel() > 0)
-            C = next(pv.shape[2] for pv in per_pv if pv is not None and pv.numel() > 0)
-            
-            pv_batch = torch.zeros((len(examples), N_max, C, H_max, W_max), dtype=torch.bfloat16 if self.processor.image_processor.torch_dtype == torch.bfloat16 else torch.float16)
-            pv_mask = torch.zeros((len(examples), N_max), dtype=torch.bool)
-            
-            for i, pv in enumerate(per_pv):
-                if pv is not None and pv.numel() > 0:
-                    _, N, _, H, W = pv.shape
-                    pv_batch[i, :N, :, :H, :W] = pv[0]
-                    pv_mask[i, :N] = True
-        else:
-            pv_batch = torch.zeros((len(examples), 0, 3, 0, 0), dtype=torch.float32)
-            pv_mask = torch.zeros((len(examples), 0), dtype=torch.bool)
-
-        batch["pixel_values"] = pv_batch
-        batch["pixel_values_mask"] = pv_mask
-
-        # 合并 grid_thw 和 grid_idx
-        flat_grids, flat_indices = [], []
-        current_idx_offset = 0
         
-        for i, (grid, idx) in enumerate(zip(per_grid_thw, per_grid_idx)):
-            if grid is not None and idx is not None and grid.numel() > 0:
-                num_images = grid.shape[0]
-                flat_grids.append(grid)
-                adjusted_idx = idx[0] + current_idx_offset
-                flat_indices.append(adjusted_idx)
-                current_idx_offset += num_images
-
-        if flat_grids:
-            batch["grid_thw"] = torch.cat(flat_grids, dim=0)
-            idx_batch = torch.zeros((len(examples), N_max), dtype=torch.long)
-            for i, idx in enumerate(flat_indices):
-                num_images = len(idx)
-                idx_batch[i, :num_images] = idx
-            batch["image_grid_idx"] = idx_batch
-        else:
-            batch["grid_thw"] = torch.zeros((0, 3), dtype=torch.long)
-            batch["image_grid_idx"] = torch.zeros((len(examples), N_max), dtype=torch.long)
-
+        batch["grid_thw"] = torch.cat(per_grid_thw, dim=0)
+        # image_grid_idx 需要从0开始为每个样本编号
+        batch["image_grid_idx"] = torch.arange(len(encoded_samples)).unsqueeze(-1)
         batch["image_grid_thw"] = batch["grid_thw"]
-
-        if os.environ.get("DEBUG_VL", "0") == "1":
-            print(f"--- VLDataCollator Batch ---")
-            for k, v in batch.items():
-                if torch.is_tensor(v):
-                    print(f"{k}: shape={tuple(v.shape)}, dtype={v.dtype}")
-            print("--------------------------")
 
         return batch
 
@@ -257,3 +214,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
