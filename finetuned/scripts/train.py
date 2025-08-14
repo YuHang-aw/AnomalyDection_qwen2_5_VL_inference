@@ -7,17 +7,16 @@ from datasets import load_dataset, Features, Sequence, Value
 from transformers import TrainingArguments, Trainer, set_seed
 
 from src.modeling.load_qwen_vl import *
-# =========== Collator：模板→文本，占位→真实图片 ===========
 class VLDataCollator:
     """
-    最小不定修正版（接入 config）：
+    目标：
     - 逐样本 encode（truncation=False）
-    - 优先完整保留视觉块 <|vision_start|> ... <|vision_end|>
-    - 若超长：先做“整块保留式”文本截断；如视觉块本身超过 max_length：
-        * auto_downscale_if_needed=True → 等比例下采样，直到能塞进为止
-        * 否则报错，提示调小分辨率或调大 max_length
-    - 可选清洗用户文本中的 "<image>" 字面量为 "〈image〉"
-    - 所有关键阈值都可从 config 传入
+    - “视觉块优先”：截断只裁文本，从不截断 <|vision_start|>...<|vision_end|>
+    - 如视觉块本身 > max_length：可选自动降分辨率直至可放入
+    - 统一 pixel_values 形状为 Tensor
+      * 单样本: [N,C,H,W]
+      * 多样本: [B,Nmax,C,Hmax,Wmax] + pixel_values_mask 以指示真实 N
+    - 补齐 image_grid_thw（Tensor[N,3], 每行为 (t,h,w)，图像默认 t=1）与 image_sizes
     """
     def __init__(
         self,
@@ -27,16 +26,16 @@ class VLDataCollator:
         add_generation_prompt=False,
         label_pad_token_id=-100,
         sanitize_user_image_token=True,
-        # ↓↓↓ 来自配置的图像控制项
+        # 分辨率控制
         auto_downscale_if_needed=True,
-        prefer_short_side=None,   # 起始“短边”尝试值（例如 cfg['image_short_side']）
-        downscale_floor=448,      # 最低短边，防止无限缩
-        downscale_step=64,        # 无法从比例法推小就按步长减
+        prefer_short_side=None,
+        downscale_floor=448,
+        downscale_step=64,
     ):
         self.processor = processor
         self.cfg = model_config
         self.max_length = int(max_length)
-        self.add_generation_prompt = bool(add_generation_prompt)  # 训练建议 False
+        self.add_generation_prompt = bool(add_generation_prompt)
         self.label_pad_token_id = int(label_pad_token_id)
         self.sanitize_user_image_token = bool(sanitize_user_image_token)
 
@@ -46,12 +45,15 @@ class VLDataCollator:
         self.downscale_step  = int(downscale_step)
 
         tok = processor.tokenizer
-        # Qwen2.5-VL 的视觉相关 token id（若模型未提供则用常见文本反查）
-        self.image_token_id = getattr(self.cfg, "image_token_id", tok.convert_tokens_to_ids("<|image_pad|>"))
+        self.image_token_id  = getattr(self.cfg, "image_token_id", tok.convert_tokens_to_ids("<|image_pad|>"))
         self.vision_start_id = getattr(self.cfg, "vision_start_token_id", tok.convert_tokens_to_ids("<|vision_start|>"))
         self.vision_end_id   = getattr(self.cfg, "vision_end_token_id",   tok.convert_tokens_to_ids("<|vision_end|>"))
 
-        # 清洗用
+        # 视觉 patch 尺寸（用于回推网格）；Qwen2/2.5-VL 通常为 14
+        vc = getattr(self.cfg, "vision_config", None)
+        self.patch_size = int(getattr(vc, "patch_size", 14)) if vc is not None else 14
+
+        # 文本里误写 "<image>" 时的清洗
         self._user_image_literal = "<image>"
         self._user_image_safe = "〈image〉"
 
@@ -70,7 +72,6 @@ class VLDataCollator:
         return img.resize((nw, nh), Image.BICUBIC)
 
     def _find_blocks(self, ids):
-        """返回视觉块 [start, end] 闭区间列表，以及块内 image_token 计数。"""
         starts, ends = [], []
         for i, t in enumerate(ids):
             if t == self.vision_start_id: starts.append(i)
@@ -83,19 +84,61 @@ class VLDataCollator:
         si = 0
         for ei in range(len(ends)):
             s, e = starts[si], ends[ei]
-            if s > e:
-                return [], -1
+            if s > e: return [], -1
             blocks.append((s, e))
             total_img += sum(1 for t in ids[s:e+1] if t == self.image_token_id)
             si += 1
         return blocks, total_img
+
+    # ---- 工具：从“原始 enc['pixel_values']”回推出每张图的(H,W)与(t,h,w) ----
+    def _extract_sizes_from_pv(self, pv):
+        import torch
+        sizes = []
+        if torch.is_tensor(pv):
+            if pv.dim() == 4:  # [N,C,H,W]
+                N, _, H, W = pv.shape
+                sizes = [(int(H), int(W)) for _ in range(N)]
+            elif pv.dim() == 3:  # [C,H,W]
+                _, H, W = pv.shape
+                sizes = [(int(H), int(W))]
+            elif pv.dim() == 2:  # [H,W]（极少数分支）
+                H, W = pv.shape
+                sizes = [(int(H), int(W))]
+            else:
+                raise ValueError(f"Unexpected pixel_values dims: {pv.dim()}")
+        elif isinstance(pv, (list, tuple)):
+            for t in pv:
+                if not hasattr(t, "shape"):
+                    raise ValueError("pixel_values list elements must be tensors")
+                if t.dim() == 4:
+                    for u in t:
+                        sizes.append((int(u.shape[-2]), int(u.shape[-1])))
+                elif t.dim() == 3:
+                    sizes.append((int(t.shape[-2]), int(t.shape[-1])))
+                elif t.dim() == 2:
+                    sizes.append((int(t.shape[-2]), int(t.shape[-1])))
+                else:
+                    raise ValueError(f"Unexpected per-image dims: {t.dim()}")
+        else:
+            raise ValueError("pixel_values must be Tensor or list of Tensors")
+        return sizes
+
+    def _grid_thw_from_sizes(self, sizes):
+        import math, torch
+        out = []
+        for (H, W) in sizes:
+            th = int(math.ceil(H / float(self.patch_size)))
+            tw = int(math.ceil(W / float(self.patch_size)))
+            out.append((1, th, tw))  # 静态图 t=1
+        # 统一成 Tensor[N,3]，很多实现（含 vLLM）要求二维
+        return torch.tensor(out, dtype=torch.int32)
 
     def __call__(self, examples):
         from PIL import Image
         import torch, math
         tok = self.processor.tokenizer
 
-        # 1) 组织模板输入：图片只放“占位”，真实 PIL 由 processor 处理；可选清洗 "<image>"
+        # 1) 图文模板：图片用占位，真实 PIL 交给 processor
         chats_for_template, images_batch = [], []
         for ex in examples:
             mm_tpl, imgs = [], []
@@ -118,14 +161,20 @@ class VLDataCollator:
             chats_for_template, add_generation_prompt=self.add_generation_prompt, tokenize=False
         )
 
-        # 2) 逐样本 encode（不截断）；必要时对该样本“按需降分辨率”
         encoded = []
         for prompt, imgs in zip(prompts, images_batch):
-            try_short = self.prefer_short_side or 896  # 起步短边（可从 cfg['image_short_side'] 传入）
+            try_short = self.prefer_short_side or 896
             cur_imgs = imgs
 
             while True:
                 enc = self.processor(text=prompt, images=cur_imgs, padding=False, truncation=False, return_tensors="pt")
+
+                # —— 立刻用“原始 pixel_values”回推 grid/sizes（在任何 padding/stack 之前）
+                if "pixel_values" in enc:
+                    sizes0 = self._extract_sizes_from_pv(enc["pixel_values"])
+                    enc["image_sizes"] = sizes0
+                    enc["image_grid_thw"] = self._grid_thw_from_sizes(sizes0)
+
                 ids = enc["input_ids"][0]
                 am  = enc["attention_mask"][0]
                 ids_list = ids.tolist()
@@ -140,159 +189,135 @@ class VLDataCollator:
                     max_keep = max(e for _, e in blocks) + 1
                     need = max_keep - min_keep
                 else:
-                    min_keep = 0
-                    max_keep = 0
-                    need = 0
+                    min_keep = 0; max_keep = 0; need = 0
 
-                # 2.1 视觉块能放下 → 如整体仍超长，做“整块保留式”文本截断
                 if need <= self.max_length:
                     if L > self.max_length and blocks:
-                        left = max(0, L - self.max_length)  # 优先保尾
-                        if left > min_keep: left = min_keep  # 不能切断第一块视觉
+                        left = max(0, L - self.max_length)  # 保尾
+                        if left > min_keep: left = min_keep
                         if left + self.max_length < max_keep:
                             left = max(0, max_keep - self.max_length)
                         ids = ids[left:left+self.max_length]
                         am  = am[left:left+self.max_length]
                         enc["input_ids"] = ids.unsqueeze(0)
                         enc["attention_mask"] = am.unsqueeze(0)
-                    break  # 这条样本 OK
+                    break  # OK
 
-                # 2.2 视觉块本身 > max_length
                 if not self.auto_downscale_if_needed:
                     raise ValueError(
                         f"Visual token span ({need}) > max_length ({self.max_length}). "
                         f"Set a smaller image size (e.g., image_short_side=896) or enable auto_downscale_if_needed."
                     )
 
-                # 按需下采样：估算缩放比例，把 need 压到 95% budget
+                # 自动降分：按比例估算短边
                 scale = math.sqrt(self.max_length / need) * 0.95
                 new_short = max(self.downscale_floor, int(try_short * scale))
                 if new_short >= try_short:
                     new_short = max(self.downscale_floor, try_short - self.downscale_step)
-
                 if new_short < self.downscale_floor or new_short == try_short:
                     raise ValueError(
                         f"Even after planned downscaling (floor={self.downscale_floor}), "
-                        f"visual span ({need}) > max_length ({self.max_length}). "
-                        f"建议：把 image_short_side 调到 896/672，或提高 max_length（若模型支持）。"
+                        f"visual span ({need}) > max_length ({self.max_length})."
                     )
-
-                # 真的缩图再重编一次
                 cur_imgs = [self._resize_keep_short(im, new_short) for im in cur_imgs]
                 try_short = new_short
 
             encoded.append(enc)
 
-        # === 3) 右侧 padding → batch，labels 的 padding 置 -100（保持不变）===
+        # 3) 文本齐长 + labels
         max_len = max(e["input_ids"].shape[-1] for e in encoded)
         pad_id = tok.pad_token_id
         input_ids_list, attn_list = [], []
         for e in encoded:
-            ids = e["input_ids"][0]
-            am  = e["attention_mask"][0]
+            ids = e["input_ids"][0]; am = e["attention_mask"][0]
             pad_n = max_len - ids.shape[-1]
             if pad_n > 0:
                 ids = torch.nn.functional.pad(ids, (0, pad_n), value=pad_id)
                 am  = torch.nn.functional.pad(am,  (0, pad_n), value=0)
-            input_ids_list.append(ids)
-            attn_list.append(am)
+            input_ids_list.append(ids); attn_list.append(am)
 
         input_ids = torch.stack(input_ids_list, dim=0)
         attention_mask = torch.stack(attn_list, dim=0)
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = self.label_pad_token_id
-
+        labels = input_ids.clone(); labels[attention_mask == 0] = self.label_pad_token_id
         batch = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        # === 4) pixel_values — 统一成 Tensor，覆盖 2D/3D/4D/list 的所有形态 ===
+        # 4) 统一 pixel_values → Tensor；并打包 grid/sizes 一起返回
         def _ensure_chw(t: torch.Tensor) -> torch.Tensor:
-            """
-            把任意一张图规整成 [C,H,W]：
-            - [H,W]  → [1,H,W]（随后会复制到 3 通道）
-            - [C,H,W] 保持
-            - 其他维度一律报错（不应该出现）
-            """
             if t.dim() == 2:  # [H,W]
-                t = t.unsqueeze(0)  # [1,H,W]
+                t = t.unsqueeze(0)
             elif t.dim() == 3:  # [C,H,W]
                 pass
             else:
                 raise ValueError(f"Single image tensor must be 2D/3D, got {t.dim()}D.")
-            # 单通道 → 3 通道（RGB）
-            if t.shape[0] == 1:
+            if t.shape[0] == 1:  # 灰度 → 3 通道
                 t = t.repeat(3, 1, 1)
             return t
 
         def _to_4d_per_sample(pv):
-            """
-            把“本样本”的 pixel_values 规整成 [Ni,C,H,W]：
-            - Tensor: [H,W]/[C,H,W]/[N,C,H,W]
-            - List/Tuple: [Tensor(...), ...]，元素可混合 2D/3D/4D（4D 会拆开）
-            """
             if torch.is_tensor(pv):
-                if pv.dim() == 4:           # [N,C,H,W]
-                    # 也容错 N=1,C=H;W=... 等怪形态，但假设标准 4D
-                    Ni, Ci, Hi, Wi = pv.shape
-                    if Ci == 1:
-                        pv = pv.repeat(1, 3, 1, 1)
+                if pv.dim() == 4:  # [N,C,H,W]
+                    if pv.shape[1] == 1: pv = pv.repeat(1,3,1,1)
                     return pv
-                elif pv.dim() in (2, 3):    # [H,W] / [C,H,W]
-                    chw = _ensure_chw(pv)   # -> [C,H,W]
-                    return chw.unsqueeze(0) # -> [1,C,H,W]
+                elif pv.dim() in (2, 3):
+                    chw = _ensure_chw(pv)
+                    return chw.unsqueeze(0)  # [1,C,H,W]
                 else:
                     raise ValueError(f"pixel_values tensor must be 2D/3D/4D, got {pv.dim()}D.")
-
             elif isinstance(pv, (list, tuple)):
                 imgs = []
                 for t in pv:
-                    if not torch.is_tensor(t):
-                        raise ValueError("pixel_values list elements must be torch.Tensor")
-                    if t.dim() == 4:  # [N,C,H,W] → 拆到 3D
-                        for u in t:
-                            imgs.append(_ensure_chw(u))
+                    if t.dim() == 4:
+                        for u in t: imgs.append(_ensure_chw(u))
                     else:
-                        imgs.append(_ensure_chw(t))  # 2D/3D → 3D CHW
-                # 对齐到本样本内统一 H/W 再 stack → [N,C,Hmax,Wmax]
+                        imgs.append(_ensure_chw(t))
+                # 样本内 H/W 对齐后 stack
                 sizes = [im.shape[-2:] for im in imgs]
-                max_h = max(h for h, w in sizes)
-                max_w = max(w for h, w in sizes)
+                max_h = max(h for h, w in sizes); max_w = max(w for h, w in sizes)
                 padded = []
-                for im in imgs:  # im: [C,H,W]
+                for im in imgs:
                     h, w = im.shape[-2:]
-                    pad = (0, max_w - w, 0, max_h - h)  # W-left, W-right, H-top, H-bottom
+                    pad = (0, max_w - w, 0, max_h - h)
                     padded.append(torch.nn.functional.pad(im, pad))
-                return torch.stack(padded, dim=0)  # [N,C,max_h,max_w]
-
+                return torch.stack(padded, dim=0)
             else:
                 raise ValueError("pixel_values must be Tensor or list/tuple of Tensors")
 
         if "pixel_values" in encoded[0]:
-            per_sample_pv = []
-            per_sample_mask = []
+            per_sample_pv, per_sample_mask = [], []
+            per_sample_grids, per_sample_sizes = [], []
 
-            # 每个样本规整到 [Ni,C,Hi,Wi]
             for e in encoded:
+                # 用 encode 时的 grid/sizes（基于“真实图”，未被 pad 影响）
+                grid = e.get("image_grid_thw", None)
+                sizes = e.get("image_sizes", None)
+                if grid is None or (isinstance(grid, (list, tuple)) and len(grid) == 0):
+                    sizes0 = self._extract_sizes_from_pv(e["pixel_values"])
+                    grid = self._grid_thw_from_sizes(sizes0)
+                    sizes = sizes0
+                if not torch.is_tensor(grid):
+                    grid = torch.as_tensor(grid, dtype=torch.int32)
+
                 pv = _to_4d_per_sample(e["pixel_values"])
                 per_sample_pv.append(pv)
                 per_sample_mask.append(torch.ones((pv.shape[0],), dtype=torch.bool, device=pv.device))
+                per_sample_grids.append(grid)     # Tensor[N,3]
+                per_sample_sizes.append(sizes)    # list[(H,W)]
 
             if len(encoded) == 1:
-                # 单样本：大多数 Qwen 实现接受 [N,C,H,W]
-                batch["pixel_values"] = per_sample_pv[0]
+                batch["pixel_values"] = per_sample_pv[0]         # [N,C,H,W]
                 batch["pixel_values_mask"] = per_sample_mask[0]  # [N]
+                batch["image_grid_thw"] = per_sample_grids[0]    # Tensor[N,3]
+                batch["image_sizes"]    = per_sample_sizes[0]    # list[(H,W)]
             else:
-                # 多样本：pad 到统一 [B,Nmax,C,Hmax,Wmax]
+                # 多样本：仅对 pixel_values 做 5D pad；grid/sizes 保持“逐样本列表”
                 Ns = [pv.shape[0] for pv in per_sample_pv]
                 Cs = [pv.shape[1] for pv in per_sample_pv]
                 Hs = [pv.shape[2] for pv in per_sample_pv]
                 Ws = [pv.shape[3] for pv in per_sample_pv]
-                # 断言通道一致（前面已做 1→3 复制）
-                C = Cs[0]
-                assert all(c == C for c in Cs), f"Channel mismatch: {Cs}"
+                C = Cs[0]; assert all(c == C for c in Cs), f"Channel mismatch: {Cs}"
                 Nmax, Hmax, Wmax = max(Ns), max(Hs), max(Ws)
 
-                pv_batch = []
-                mask_batch = []
+                pv_batch, mask_batch = [], []
                 for pv, m in zip(per_sample_pv, per_sample_mask):
                     Ni, Ci, Hi, Wi = pv.shape
                     if Hi != Hmax or Wi != Wmax:
@@ -300,18 +325,20 @@ class VLDataCollator:
                     if Ni < Nmax:
                         pad_imgs = torch.zeros((Nmax - Ni, C, Hmax, Wmax), dtype=pv.dtype, device=pv.device)
                         pv = torch.cat([pv, pad_imgs], dim=0)
-                        m = torch.cat([m, torch.zeros((Nmax - Ni,), dtype=torch.bool, device=m.device)], dim=0)
-                    pv_batch.append(pv.unsqueeze(0))   # [1,Nmax,C,Hmax,Wmax]
-                    mask_batch.append(m.unsqueeze(0))  # [1,Nmax]
-                batch["pixel_values"] = torch.cat(pv_batch, dim=0)        # [B,Nmax,C,Hmax,Wmax]
+                        m  = torch.cat([m, torch.zeros((Nmax - Ni,), dtype=torch.bool, device=m.device)], dim=0)
+                    pv_batch.append(pv.unsqueeze(0))
+                    mask_batch.append(m.unsqueeze(0))
+                batch["pixel_values"] = torch.cat(pv_batch, dim=0)         # [B,Nmax,C,Hmax,Wmax]
                 batch["pixel_values_mask"] = torch.cat(mask_batch, dim=0)  # [B,Nmax]
+                batch["image_grid_thw"] = per_sample_grids                  # list[Tensor[Ni,3]]
+                batch["image_sizes"]    = per_sample_sizes                  # list[list[(H,W)]]
 
-            # 保险：同时给出 images 键（有些 forward 走 images）
-            if "images" not in batch:
-                batch["images"] = batch["pixel_values"]
+            # 兼容某些 forward 的别名/键
+            batch.setdefault("images", batch["pixel_values"])
+            batch.setdefault("grid_thw", batch.get("image_grid_thw"))
 
-            assert torch.is_tensor(batch["pixel_values"]) and batch["pixel_values"].dim() in (4, 5), \
-                f"pixel_values must be 4D or 5D tensor, got {batch['pixel_values'].shape}"
+            assert torch.is_tensor(batch["pixel_values"]) and batch["pixel_values"].dim() in (4,5), \
+                f"pixel_values must be 4D/5D tensor, got {batch['pixel_values'].shape}"
 
         return batch
 
