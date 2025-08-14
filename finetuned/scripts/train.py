@@ -186,7 +186,7 @@ class VLDataCollator:
 
             encoded.append(enc)
 
-        # 3) 右侧 padding → batch，labels 的 padding 置 -100
+        # === 3) 右侧 padding → batch，labels 的 padding 置 -100（保持不变）===
         max_len = max(e["input_ids"].shape[-1] for e in encoded)
         pad_id = tok.pad_token_id
         input_ids_list, attn_list = [], []
@@ -207,59 +207,91 @@ class VLDataCollator:
 
         batch = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        # 4) pixel_values（若存在）带上
-        # === 4) pixel_values — 统一成 Tensor，绝不返回 list ===
-        def _ensure_tensor_pixel_values(pv):
-            # pv 可能是 Tensor [N,C,H,W]，也可能是 [Tensor(C,H,W), ...] 的 list
+        # === 4) pixel_values — 统一成 Tensor，支持 3D/4D/list，返回 [B,Nmax,C,Hmax,Wmax] + mask ===
+        def _to_4d_per_sample(pv):
+            # 统一把“本样本”的 pixel_values 变成 [Ni,C,H,W]
             if torch.is_tensor(pv):
-                return pv
-            assert isinstance(pv, (list, tuple)) and len(pv) > 0, "pixel_values should be Tensor or non-empty list"
-            # 对齐到本样本内的最大 H/W 再 stack
-            sizes = [t.shape[-2:] for t in pv]
-            max_h = max(h for h, w in sizes)
-            max_w = max(w for h, w in sizes)
-            padded = []
-            for t in pv:
-                h, w = t.shape[-2:]
-                # pad = (left, right, top, bottom) 对应 (W, W, H, H)
-                pad = (0, max_w - w, 0, max_h - h)
-                padded.append(torch.nn.functional.pad(t, pad))
-            return torch.stack(padded, dim=0)  # [N,C,max_h,max_w]
+                if pv.dim() == 3:   # [C,H,W] → [1,C,H,W]
+                    return pv.unsqueeze(0)
+                elif pv.dim() == 4: # [N,C,H,W]
+                    return pv
+                else:
+                    raise ValueError(f"pixel_values tensor must be 3D or 4D, got {pv.dim()}D.")
+            elif isinstance(pv, (list, tuple)):
+                assert len(pv) > 0, "pixel_values list is empty"
+                # 允许 list 里偶发 4D（把它拆成多个 3D），主要还是 3D 为主
+                imgs = []
+                for t in pv:
+                    if not torch.is_tensor(t):
+                        raise ValueError("pixel_values list elements must be torch.Tensor")
+                    if t.dim() == 3:
+                        imgs.append(t)
+                    elif t.dim() == 4:
+                        # 拆开追加
+                        for u in t:
+                            if u.dim() != 3:
+                                raise ValueError("Unexpected nested pixel tensor shape")
+                            imgs.append(u)
+                    else:
+                        raise ValueError(f"Unexpected pixel tensor dim={t.dim()}")
+                # 对齐 H/W 再 stack
+                sizes = [im.shape[-2:] for im in imgs]
+                max_h = max(h for h, w in sizes)
+                max_w = max(w for h, w in sizes)
+                padded = []
+                for im in imgs:
+                    h, w = im.shape[-2:]
+                    pad = (0, max_w - w, 0, max_h - h)  # W, W, H, H
+                    padded.append(torch.nn.functional.pad(im, pad))
+                return torch.stack(padded, dim=0)  # [N,C,max_h,max_w]
+            else:
+                raise ValueError("pixel_values must be Tensor or list/tuple of Tensors")
 
         if "pixel_values" in encoded[0]:
-            # 先把每个样本内的 pixel_values 都变成 [N,C,H,W] 的 Tensor
+            per_sample_pv = []
+            per_sample_mask = []
+            # 先每个样本各自规整成 [Ni,C,Hi,Wi]
             for e in encoded:
-                e["pixel_values"] = _ensure_tensor_pixel_values(e["pixel_values"])
+                pv = _to_4d_per_sample(e["pixel_values"])
+                # 记录真实张数（Ni）
+                per_sample_pv.append(pv)
+                per_sample_mask.append(torch.ones((pv.shape[0],), dtype=torch.bool))
 
             if len(encoded) == 1:
-                # 单样本：直接交给模型（Qwen 会在内部处理 N 张图）
-                batch["pixel_values"] = encoded[0]["pixel_values"]  # [N,C,H,W]
+                # 单样本直接交给模型；很多实现接受 [N,C,H,W]
+                batch["pixel_values"] = per_sample_pv[0]
+                batch["pixel_values_mask"] = per_sample_mask[0]  # [N]
             else:
-                # 多样本：pad 到相同 N/H/W 后再堆成 [B,Nmax,C,Hmax,Wmax]
-                shapes = [tuple(e["pixel_values"].shape) for e in encoded]  # (Ni,C,Hi,Wi)
-                C = shapes[0][1]
-                Nmax = max(s[0] for s in shapes)
-                Hmax = max(s[2] for s in shapes)
-                Wmax = max(s[3] for s in shapes)
+                # 多样本：pad N/H/W 到批次最大
+                Ns = [pv.shape[0] for pv in per_sample_pv]
+                Cs = [pv.shape[1] for pv in per_sample_pv]
+                Hs = [pv.shape[2] for pv in per_sample_pv]
+                Ws = [pv.shape[3] for pv in per_sample_pv]
+                C = Cs[0]
+                assert all(c == C for c in Cs), "All samples must share the same channel count"
+                Nmax = max(Ns); Hmax = max(Hs); Wmax = max(Ws)
 
                 pv_batch = []
-                for e, (Ni, Ci, Hi, Wi) in zip(encoded, shapes):
-                    pv = e["pixel_values"]  # [Ni,C,Hi,Wi]
+                mask_batch = []
+                for pv, m in zip(per_sample_pv, per_sample_mask):
+                    Ni, Ci, Hi, Wi = pv.shape
                     # pad H/W
                     if Hi != Hmax or Wi != Wmax:
                         pv = torch.nn.functional.pad(pv, (0, Wmax - Wi, 0, Hmax - Hi))
-                    # pad N（补零图）
+                    # pad N（用 0 图像）
                     if Ni < Nmax:
-                        pad_imgs = torch.zeros((Nmax - Ni, C, Hmax, Wmax), dtype=pv.dtype)
+                        pad_imgs = torch.zeros((Nmax - Ni, C, Hmax, Wmax), dtype=pv.dtype, device=pv.device)
                         pv = torch.cat([pv, pad_imgs], dim=0)
-                    pv_batch.append(pv.unsqueeze(0))  # -> [1,Nmax,C,Hmax,Wmax]
-                batch["pixel_values"] = torch.cat(pv_batch, dim=0)  # [B,Nmax,C,Hmax,Wmax]
+                        m = torch.cat([m, torch.zeros((Nmax - Ni,), dtype=torch.bool, device=m.device)], dim=0)
+                    pv_batch.append(pv.unsqueeze(0))  # [1,Nmax,C,Hmax,Wmax]
+                    mask_batch.append(m.unsqueeze(0)) # [1,Nmax]
+                batch["pixel_values"] = torch.cat(pv_batch, dim=0)   # [B,Nmax,C,Hmax,Wmax]
+                batch["pixel_values_mask"] = torch.cat(mask_batch, dim=0)  # [B,Nmax]
 
-            # 保险：确保一定是 Tensor
+            # 保险：一定是 Tensor
             assert torch.is_tensor(batch["pixel_values"]), "pixel_values must be a torch.Tensor"
 
         return batch
-
 
 def main():
     ap = argparse.ArgumentParser()
