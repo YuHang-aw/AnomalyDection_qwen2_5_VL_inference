@@ -10,11 +10,10 @@ from src.modeling.load_qwen_vl import *
 
 class VLDataCollator:
     """
-    最终修正版 v3:
-    - 完全信任 processor 的输出，不再自行计算 grid_thw。
-    - 直接从 processor 返回的 enc 中提取 'image_grid_thw' 和 'image_grid_idx'。
-    - 在 collator 中正确地合并这些预先计算好的张量。
-    - 文本填充保持为右填充。
+    最终修正版 v4:
+    - 修复了 `ValueError: The truth value of a Tensor... is ambiguous` 错误。
+    - 正确计算 N_max (batch内单个样本的最大图片数)，避免对 Tensor 使用 `any()`。
+    - 保留了 v3 的核心逻辑：完全信任 processor 的输出，正确打包 grid_thw 和 grid_idx。
     """
     def __init__(self, processor, model_config, max_length=4096,
                  add_generation_prompt=False, label_pad_token_id=-100,
@@ -50,14 +49,6 @@ class VLDataCollator:
         else:
             return img.resize((int(w * (new_short / h)), new_short), Image.BICUBIC)
 
-    def _find_vision_blocks(self, ids, vision_start_id, vision_end_id):
-        starts, ends = [], []
-        for i, t in enumerate(ids):
-            if t == vision_start_id: starts.append(i)
-            elif t == vision_end_id: ends.append(i)
-        if not starts or len(starts) != len(ends): return []
-        return list(zip(starts, ends))
-
     def __call__(self, examples):
         from PIL import Image
         import torch, math
@@ -91,37 +82,28 @@ class VLDataCollator:
             try_short = self.prefer_short_side or 896
             cur_imgs = imgs
             while True:
-                # processor 会返回所有需要的东西，包括 grid_thw 和 grid_idx
                 enc = self.processor(text=prompt, images=cur_imgs, padding=False, truncation=False, return_tensors="pt")
-                
-                ids = enc["input_ids"][0]
-                L = ids.shape[-1]
-                
-                # 检查是否超长
+                L = enc["input_ids"].shape[1]
                 if L <= self.max_length:
                     break
-
                 if not self.auto_downscale_if_needed:
                     raise ValueError(f"Sequence length ({L}) > max_length ({self.max_length}).")
-                
-                # 降分辨率重试
                 scale = math.sqrt(self.max_length / L) * 0.95
                 new_short = max(self.downscale_floor, int(try_short * scale))
                 if new_short >= try_short:
                     new_short = max(self.downscale_floor, try_short - self.downscale_step)
                 if new_short < self.downscale_floor or new_short == try_short:
                     raise ValueError(f"Downscaling failed to reduce sequence length below {self.max_length}.")
-                
                 cur_imgs = [self._resize_keep_short(im, new_short) for im in cur_imgs]
                 try_short = new_short
             encoded_samples.append(enc)
 
         # 3) 文本右填充 + labels
-        max_len = max(e["input_ids"].shape[-1] for e in encoded_samples)
+        max_len = max(e["input_ids"].shape[1] for e in encoded_samples)
         batch_input_ids, batch_attention_mask = [], []
         for enc in encoded_samples:
             ids, am = enc["input_ids"][0], enc["attention_mask"][0]
-            pad_n = max_len - ids.shape[-1]
+            pad_n = max_len - ids.shape[1]
             if pad_n > 0:
                 ids = torch.nn.functional.pad(ids, (0, pad_n), value=self.pad_token_id)
                 am  = torch.nn.functional.pad(am,  (0, pad_n), value=0)
@@ -139,23 +121,29 @@ class VLDataCollator:
         per_grid_thw = [enc.get('image_grid_thw') for enc in encoded_samples]
         per_grid_idx = [enc.get('image_grid_idx') for enc in encoded_samples]
 
-        # Pad pixel_values to 5D
-        N_max = max(pv.shape[1] for pv in per_pv if pv is not None and pv.dim() == 5) if any(per_pv) else 0
+        # 关键修正: 正确计算 N_max
+        image_counts = [
+            pv.shape[1] 
+            for pv in per_pv 
+            if pv is not None and pv.dim() == 5 and pv.numel() > 0
+        ]
+        N_max = max(image_counts) if image_counts else 0
+
         if N_max > 0:
-            H_max = max(pv.shape[3] for pv in per_pv if pv is not None)
-            W_max = max(pv.shape[4] for pv in per_pv if pv is not None)
-            C = per_pv[0].shape[2]
+            H_max = max(pv.shape[3] for pv in per_pv if pv is not None and pv.numel() > 0)
+            W_max = max(pv.shape[4] for pv in per_pv if pv is not None and pv.numel() > 0)
+            C = next(pv.shape[2] for pv in per_pv if pv is not None and pv.numel() > 0)
             
             pv_batch = torch.zeros((len(examples), N_max, C, H_max, W_max), dtype=per_pv[0].dtype)
             pv_mask = torch.zeros((len(examples), N_max), dtype=torch.bool)
             
             for i, pv in enumerate(per_pv):
-                if pv is not None:
+                if pv is not None and pv.numel() > 0:
                     _, N, _, H, W = pv.shape
-                    pv_batch[i, :N, :, :H, :W] = pv[0] # processor 返回的是 [1, N, C, H, W]
+                    pv_batch[i, :N, :, :H, :W] = pv[0]
                     pv_mask[i, :N] = True
         else:
-            pv_batch = torch.zeros((len(examples), 0, 3, 0, 0))
+            pv_batch = torch.zeros((len(examples), 0, 3, 0, 0), dtype=torch.float32)
             pv_mask = torch.zeros((len(examples), 0), dtype=torch.bool)
 
         batch["pixel_values"] = pv_batch
@@ -166,17 +154,15 @@ class VLDataCollator:
         current_idx_offset = 0
         
         for i, (grid, idx) in enumerate(zip(per_grid_thw, per_grid_idx)):
-            if grid is not None and idx is not None:
+            if grid is not None and idx is not None and grid.numel() > 0:
                 num_images = grid.shape[0]
                 flat_grids.append(grid)
-                # 调整索引的偏移量
                 adjusted_idx = idx[0] + current_idx_offset
                 flat_indices.append(adjusted_idx)
                 current_idx_offset += num_images
 
         if flat_grids:
             batch["grid_thw"] = torch.cat(flat_grids, dim=0)
-            # Pad image_grid_idx
             idx_batch = torch.zeros((len(examples), N_max), dtype=torch.long)
             for i, idx in enumerate(flat_indices):
                 num_images = len(idx)
@@ -184,9 +170,8 @@ class VLDataCollator:
             batch["image_grid_idx"] = idx_batch
         else:
             batch["grid_thw"] = torch.zeros((0, 3), dtype=torch.long)
-            batch["image_grid_idx"] = torch.zeros((len(examples), 0), dtype=torch.long)
+            batch["image_grid_idx"] = torch.zeros((len(examples), N_max), dtype=torch.long)
 
-        # 兼容别名
         batch["image_grid_thw"] = batch["grid_thw"]
 
         if os.environ.get("DEBUG_VL", "0") == "1":
@@ -197,7 +182,6 @@ class VLDataCollator:
             print("--------------------------")
 
         return batch
-
 
 def main():
     ap = argparse.ArgumentParser()
