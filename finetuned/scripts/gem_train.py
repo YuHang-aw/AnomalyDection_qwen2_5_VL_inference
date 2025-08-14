@@ -11,10 +11,11 @@ from src.modeling.load_qwen_vl import *
 class VLDataCollator:
     """
     最终修正版：
-    - grid_thw：整个 batch 合并成一个扁平的 torch.LongTensor[TotalImages, 3]
-    - image_grid_idx：新增 LongTensor[B, N_max]，指示每个样本的 grid 在 grid_thw 中的行索引
-    - h/w：基于像素尺寸计算，向上补齐到 spatial_merge_size 的倍数，且 >= m
-    - pixel_values：5D Tensor [B, N_max, C, H_max, W_max] + pixel_values_mask
+    - 文本填充：必须使用右填充 (right-padding)，并确保 tokenizer 有效的 pad_token_id。
+    - grid_thw：整个 batch 合并成一个扁平的 torch.LongTensor[TotalImages, 3]。
+    - image_grid_idx：新增 LongTensor[B, N_max]，指示每个样本的 grid 在 grid_thw 中的行索引。
+    - h/w：基于像素尺寸计算，向上补齐到 spatial_merge_size 的倍数，且 >= m。
+    - pixel_values：5D Tensor [B, N_max, C, H_max, W_max] + pixel_values_mask。
     """
     def __init__(self, processor, model_config, max_length=4096,
                  add_generation_prompt=False, label_pad_token_id=-100,
@@ -34,6 +35,11 @@ class VLDataCollator:
         self.downscale_step  = int(downscale_step)
 
         tok = processor.tokenizer
+        # 关键修正 1: 确保 pad_token 已设置，否则会导致 pad_id 为 None 或无效值
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        self.pad_token_id = tok.pad_token_id
+
         self.image_token_id  = getattr(model_config, "image_token_id", tok.convert_tokens_to_ids("<|image_pad|>"))
         self.vision_start_id = getattr(model_config, "vision_start_token_id", tok.convert_tokens_to_ids("<|vision_start|>"))
         self.vision_end_id   = getattr(model_config, "vision_end_token_id",   tok.convert_tokens_to_ids("<|vision_end|>"))
@@ -62,12 +68,11 @@ class VLDataCollator:
             elif t == self.vision_end_id: ends.append(i)
         if not starts and not ends: return [], 0
         if len(starts) != len(ends): return [], -1
-        blocks, total_img = [], 0
+        blocks = []
         for s, e in zip(starts, ends):
             if s > e: return [], -1
             blocks.append((s, e))
-            total_img += sum(1 for t in ids[s:e+1] if t == self.image_token_id)
-        return blocks, total_img
+        return blocks, 0 # a placeholder for total_img count
 
     def _extract_sizes_from_pv(self, pv):
         sizes = []
@@ -103,7 +108,6 @@ class VLDataCollator:
     def __call__(self, examples):
         from PIL import Image
         import torch, math
-        tok = self.processor.tokenizer
 
         # 1) 模板 + PIL
         chats_for_template, images_batch = [], []
@@ -144,8 +148,12 @@ class VLDataCollator:
                 else: need = 0
 
                 if need <= self.max_length:
-                    if L > self.max_length and blocks:
-                        left = max(0, max_keep - self.max_length)
+                    if L > self.max_length:
+                         # 截断时，优先保留视觉部分和其后的文本
+                        if blocks:
+                            left = max(0, max_keep - self.max_length)
+                        else: # 如果没有图像，从左边截断
+                            left = L - self.max_length
                         enc["input_ids"] = ids[left:left+self.max_length].unsqueeze(0)
                         enc["attention_mask"] = enc["attention_mask"][0][left:left+self.max_length].unsqueeze(0)
                     break
@@ -160,14 +168,14 @@ class VLDataCollator:
 
         # 3) 文本 pad + labels
         max_len = max(e["input_ids"].shape[-1] for e in encoded)
-        pad_id = tok.pad_token_id
         ids_list, am_list = [], []
         for e in encoded:
             ids, am = e["input_ids"][0], e["attention_mask"][0]
             pad_n = max_len - ids.shape[-1]
             if pad_n > 0:
-                ids = torch.nn.functional.pad(ids, (pad_n, 0), value=pad_id) # 左-pad
-                am = torch.nn.functional.pad(am, (pad_n, 0), value=0)
+                # 关键修正 2: 必须使用右-padding (right-padding)
+                ids = torch.nn.functional.pad(ids, (0, pad_n), value=self.pad_token_id)
+                am = torch.nn.functional.pad(am, (0, pad_n), value=0)
             ids_list.append(ids); am_list.append(am)
         input_ids = torch.stack(ids_list, dim=0)
         attention_mask = torch.stack(am_list, dim=0)
@@ -185,9 +193,9 @@ class VLDataCollator:
                 elif pv.dim() in (2,3): return _ensure_chw(pv).unsqueeze(0)
             imgs = [_ensure_chw(t) for t in pv]
             sizes = [im.shape[-2:] for im in imgs]
-            max_h, max_w = max(s[0] for s in sizes), max(s[1] for s in sizes)
+            max_h, max_w = (max(s[0] for s in sizes), max(s[1] for s in sizes)) if sizes else (0,0)
             padded = [torch.nn.functional.pad(im, (0, max_w-im.shape[-1], 0, max_h-im.shape[-2])) for im in imgs]
-            return torch.stack(padded, dim=0)
+            return torch.stack(padded, dim=0) if padded else torch.zeros((0,3,0,0))
 
         per_pv, per_grid = [], []
         for e in encoded:
@@ -197,16 +205,22 @@ class VLDataCollator:
             per_pv.append(pv); per_grid.append(grid)
 
         # 合并 pixel_values 到 5D
-        N_max = max(pv.shape[0] for pv in per_pv)
-        H_max = max(pv.shape[2] for pv in per_pv)
-        W_max = max(pv.shape[3] for pv in per_pv)
-        C = per_pv[0].shape[1]
-        pv_batch = torch.zeros((len(examples), N_max, C, H_max, W_max), dtype=per_pv[0].dtype)
-        pv_mask = torch.zeros((len(examples), N_max), dtype=torch.bool)
-        for i, pv in enumerate(per_pv):
-            N, _, H, W = pv.shape
-            pv_batch[i, :N, :, :H, :W] = pv
-            pv_mask[i, :N] = True
+        N_max = max(pv.shape[0] for pv in per_pv) if per_pv else 0
+        if N_max > 0:
+            H_max = max(pv.shape[2] for pv in per_pv)
+            W_max = max(pv.shape[3] for pv in per_pv)
+            C = per_pv[0].shape[1]
+            pv_batch = torch.zeros((len(examples), N_max, C, H_max, W_max), dtype=per_pv[0].dtype)
+            pv_mask = torch.zeros((len(examples), N_max), dtype=torch.bool)
+            for i, pv in enumerate(per_pv):
+                N, _, H, W = pv.shape
+                if N > 0:
+                    pv_batch[i, :N, :, :H, :W] = pv
+                    pv_mask[i, :N] = True
+        else: # 处理没有图像的 batch
+            pv_batch = torch.zeros((len(examples), 0, 3, 0, 0))
+            pv_mask = torch.zeros((len(examples), 0), dtype=torch.bool)
+
         batch["pixel_values"] = pv_batch
         batch["pixel_values_mask"] = pv_mask
 
@@ -223,9 +237,7 @@ class VLDataCollator:
                 current_idx += N
         batch["grid_thw"] = torch.cat(flat_grids, dim=0) if flat_grids else torch.zeros((0,3), dtype=torch.long)
         batch["image_grid_idx"] = grid_idx
-
-        # 兼容别名
-        batch["image_grid_thw"] = batch["grid_thw"]
+        batch["image_grid_thw"] = batch["grid_thw"] # 兼容别名
 
         if os.environ.get("DEBUG_VL", "0") == "1":
             print(f"--- VLDataCollator Batch ---")
@@ -308,4 +320,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
