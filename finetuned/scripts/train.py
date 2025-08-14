@@ -123,15 +123,16 @@ class VLDataCollator:
             raise ValueError("pixel_values must be Tensor or list of Tensors")
         return sizes
 
-    def _grid_thw_from_sizes(self, sizes):
-        import math, torch
+    def _grid_list_from_sizes(self, sizes):
+        # sizes: list[(H, W)] → list[(t=1, h, w)]
         out = []
+        patch = self.patch_size if hasattr(self, "patch_size") else 14
         for (H, W) in sizes:
-            th = int(math.ceil(H / float(self.patch_size)))
-            tw = int(math.ceil(W / float(self.patch_size)))
-            out.append((1, th, tw))  # 静态图 t=1
-        # 统一成 Tensor[N,3]，很多实现（含 vLLM）要求二维
-        return torch.tensor(out, dtype=torch.int32)
+            th = (int(H) + patch - 1) // patch
+            tw = (int(W) + patch - 1) // patch
+            out.append((1, int(th), int(tw)))
+        return out  # ← 关键：返回 list[tuple]，不是 Tensor
+
 
     def __call__(self, examples):
         from PIL import Image
@@ -173,7 +174,7 @@ class VLDataCollator:
                 if "pixel_values" in enc:
                     sizes0 = self._extract_sizes_from_pv(enc["pixel_values"])
                     enc["image_sizes"] = sizes0
-                    enc["image_grid_thw"] = self._grid_thw_from_sizes(sizes0)
+                    enc["image_grid_thw"] = self._grid_list_from_sizes(sizes0)
 
                 ids = enc["input_ids"][0]
                 am  = enc["attention_mask"][0]
@@ -292,8 +293,14 @@ class VLDataCollator:
                 sizes = e.get("image_sizes", None)
                 if grid is None or (isinstance(grid, (list, tuple)) and len(grid) == 0):
                     sizes0 = self._extract_sizes_from_pv(e["pixel_values"])
-                    grid = self._grid_thw_from_sizes(sizes0)
+                    grid = self._grid_list_from_sizes(sizes0)
                     sizes = sizes0
+                assert isinstance(grid, (list, tuple)), "grid_thw must be list/tuple"
+                assert all(isinstance(x, (list, tuple)) and len(x) == 3 for x in grid), \
+                    f"grid_thw malformed: {grid[:1]}"
+
+                per_sample_grids.append(list(tuple(map(int, x)) for x in grid))  # 统一为 list[tuple(int,int,int)]
+                per_sample_sizes.append([(int(H), int(W)) for (H, W) in sizes])
                 if not torch.is_tensor(grid):
                     grid = torch.as_tensor(grid, dtype=torch.int32)
 
@@ -306,8 +313,8 @@ class VLDataCollator:
             if len(encoded) == 1:
                 batch["pixel_values"] = per_sample_pv[0]         # [N,C,H,W]
                 batch["pixel_values_mask"] = per_sample_mask[0]  # [N]
-                batch["image_grid_thw"] = per_sample_grids[0]    # Tensor[N,3]
-                batch["image_sizes"]    = per_sample_sizes[0]    # list[(H,W)]
+                batch["image_grid_thw"] = per_sample_grids
+                batch["image_sizes"]    = per_sample_sizes
             else:
                 # 多样本：仅对 pixel_values 做 5D pad；grid/sizes 保持“逐样本列表”
                 Ns = [pv.shape[0] for pv in per_sample_pv]
