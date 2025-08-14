@@ -96,3 +96,15 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# # 为训练集生成
+# python make_sft_jsonl.py \
+#   --regions_jsonl ./data/prepared/regions_train.jsonl \
+#   --out_jsonl ./data/prepared/sft_train.jsonl \
+#   --crops_dir ./data/prepared/crops_train
+
+# # 为验证集生成
+# python make_sft_jsonl.py \
+#   --regions_jsonl ./data/prepared/regions_val.jsonl \
+#   --out_jsonl ./data/prepared/sft_val.jsonl \
+#   --crops_dir ./data/prepared/crops_val
