@@ -7,6 +7,7 @@ from datasets import load_dataset, Features, Sequence, Value
 from transformers import TrainingArguments, Trainer, set_seed
 
 from src.modeling.load_qwen_vl import *
+
 class VLDataCollator:
     """
     目标：
@@ -16,7 +17,7 @@ class VLDataCollator:
     - 统一 pixel_values 形状为 Tensor
       * 单样本: [N,C,H,W]
       * 多样本: [B,Nmax,C,Hmax,Wmax] + pixel_values_mask 以指示真实 N
-    - 补齐 image_grid_thw（Tensor[N,3], 每行为 (t,h,w)，图像默认 t=1）与 image_sizes
+    - 补齐 image_grid_thw（list[tuple(t,h,w)]，静态图 t=1）与 image_sizes（list[(H,W)]）
     """
     def __init__(
         self,
@@ -90,9 +91,8 @@ class VLDataCollator:
             si += 1
         return blocks, total_img
 
-    # ---- 工具：从“原始 enc['pixel_values']”回推出每张图的(H,W)与(t,h,w) ----
+    # ---- 从“原始 enc['pixel_values']”回推出每张图的(H,W) ----
     def _extract_sizes_from_pv(self, pv):
-        import torch
         sizes = []
         if torch.is_tensor(pv):
             if pv.dim() == 4:  # [N,C,H,W]
@@ -101,14 +101,14 @@ class VLDataCollator:
             elif pv.dim() == 3:  # [C,H,W]
                 _, H, W = pv.shape
                 sizes = [(int(H), int(W))]
-            elif pv.dim() == 2:  # [H,W]（极少数分支）
+            elif pv.dim() == 2:  # [H,W]
                 H, W = pv.shape
                 sizes = [(int(H), int(W))]
             else:
                 raise ValueError(f"Unexpected pixel_values dims: {pv.dim()}")
         elif isinstance(pv, (list, tuple)):
             for t in pv:
-                if not hasattr(t, "shape"):
+                if not torch.is_tensor(t):
                     raise ValueError("pixel_values list elements must be tensors")
                 if t.dim() == 4:
                     for u in t:
@@ -123,20 +123,19 @@ class VLDataCollator:
             raise ValueError("pixel_values must be Tensor or list of Tensors")
         return sizes
 
+    # ---- sizes: list[(H, W)] → list[(t=1, h, w)]（**返回 list[tuple]，不返回 Tensor**）----
     def _grid_list_from_sizes(self, sizes):
-        # sizes: list[(H, W)] → list[(t=1, h, w)]
         out = []
-        patch = self.patch_size if hasattr(self, "patch_size") else 14
+        patch = self.patch_size
         for (H, W) in sizes:
             th = (int(H) + patch - 1) // patch
             tw = (int(W) + patch - 1) // patch
             out.append((1, int(th), int(tw)))
-        return out  # ← 关键：返回 list[tuple]，不是 Tensor
-
+        return out
 
     def __call__(self, examples):
         from PIL import Image
-        import torch, math
+        import math
         tok = self.processor.tokenizer
 
         # 1) 图文模板：图片用占位，真实 PIL 交给 processor
@@ -173,8 +172,8 @@ class VLDataCollator:
                 # —— 立刻用“原始 pixel_values”回推 grid/sizes（在任何 padding/stack 之前）
                 if "pixel_values" in enc:
                     sizes0 = self._extract_sizes_from_pv(enc["pixel_values"])
-                    enc["image_sizes"] = sizes0
-                    enc["image_grid_thw"] = self._grid_list_from_sizes(sizes0)
+                    enc["image_sizes"] = [(int(H), int(W)) for (H, W) in sizes0]
+                    enc["image_grid_thw"] = self._grid_list_from_sizes(enc["image_sizes"])  # list[tuple]
 
                 ids = enc["input_ids"][0]
                 am  = enc["attention_mask"][0]
@@ -267,6 +266,8 @@ class VLDataCollator:
             elif isinstance(pv, (list, tuple)):
                 imgs = []
                 for t in pv:
+                    if not torch.is_tensor(t):
+                        raise ValueError("pixel_values list elements must be tensor")
                     if t.dim() == 4:
                         for u in t: imgs.append(_ensure_chw(u))
                     else:
@@ -288,33 +289,30 @@ class VLDataCollator:
             per_sample_grids, per_sample_sizes = [], []
 
             for e in encoded:
-                # 用 encode 时的 grid/sizes（基于“真实图”，未被 pad 影响）
+                # grid/sizes：基于“真实图”，不因后续 pad 改变；并且**保持成 list[tuple]**
                 grid = e.get("image_grid_thw", None)
                 sizes = e.get("image_sizes", None)
-                if grid is None or (isinstance(grid, (list, tuple)) and len(grid) == 0):
+                if not grid or not isinstance(grid, (list, tuple)):
                     sizes0 = self._extract_sizes_from_pv(e["pixel_values"])
                     grid = self._grid_list_from_sizes(sizes0)
                     sizes = sizes0
-                assert isinstance(grid, (list, tuple)), "grid_thw must be list/tuple"
+                # 强校验
                 assert all(isinstance(x, (list, tuple)) and len(x) == 3 for x in grid), \
                     f"grid_thw malformed: {grid[:1]}"
-
-                per_sample_grids.append(list(tuple(map(int, x)) for x in grid))  # 统一为 list[tuple(int,int,int)]
-                per_sample_sizes.append([(int(H), int(W)) for (H, W) in sizes])
-                if not torch.is_tensor(grid):
-                    grid = torch.as_tensor(grid, dtype=torch.int32)
+                grid = [ (int(t), int(h), int(w)) for (t,h,w) in grid ]
+                sizes = [ (int(H), int(W)) for (H,W) in sizes ]
 
                 pv = _to_4d_per_sample(e["pixel_values"])
                 per_sample_pv.append(pv)
                 per_sample_mask.append(torch.ones((pv.shape[0],), dtype=torch.bool, device=pv.device))
-                per_sample_grids.append(grid)     # Tensor[N,3]
-                per_sample_sizes.append(sizes)    # list[(H,W)]
+                per_sample_grids.append(grid)   # <- list[tuple]
+                per_sample_sizes.append(sizes)  # <- list[(H,W)]
 
             if len(encoded) == 1:
                 batch["pixel_values"] = per_sample_pv[0]         # [N,C,H,W]
                 batch["pixel_values_mask"] = per_sample_mask[0]  # [N]
-                batch["image_grid_thw"] = per_sample_grids
-                batch["image_sizes"]    = per_sample_sizes
+                batch["image_grid_thw"] = per_sample_grids[0]    # list[tuple]（单样本——扁平！）
+                batch["image_sizes"]    = per_sample_sizes[0]    # list[(H,W)]
             else:
                 # 多样本：仅对 pixel_values 做 5D pad；grid/sizes 保持“逐样本列表”
                 Ns = [pv.shape[0] for pv in per_sample_pv]
@@ -337,17 +335,26 @@ class VLDataCollator:
                     mask_batch.append(m.unsqueeze(0))
                 batch["pixel_values"] = torch.cat(pv_batch, dim=0)         # [B,Nmax,C,Hmax,Wmax]
                 batch["pixel_values_mask"] = torch.cat(mask_batch, dim=0)  # [B,Nmax]
-                batch["image_grid_thw"] = per_sample_grids                  # list[Tensor[Ni,3]]
+                batch["image_grid_thw"] = per_sample_grids                  # list[list[tuple]]
                 batch["image_sizes"]    = per_sample_sizes                  # list[list[(H,W)]]
 
             # 兼容某些 forward 的别名/键
             batch.setdefault("images", batch["pixel_values"])
-            batch.setdefault("grid_thw", batch.get("image_grid_thw"))
+            batch.setdefault("grid_thw", batch["image_grid_thw"])
 
             assert torch.is_tensor(batch["pixel_values"]) and batch["pixel_values"].dim() in (4,5), \
                 f"pixel_values must be 4D/5D tensor, got {batch['pixel_values'].shape}"
 
+        # 可选：调试打印（手动开启）
+        if os.environ.get("DEBUG_GRID", "0") == "1":
+            g = batch.get("image_grid_thw")
+            if isinstance(g, list):
+                print("GRID TYPE:", "list", "LEN:", len(g), "HEAD:", (g[:2] if len(g)>2 else g))
+            else:
+                print("GRID TYPE:", type(g))
+
         return batch
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -366,14 +373,13 @@ def main():
     train_ds = load_dataset("json",
         data_files=cfg["data"]["train_jsonl"],
         split="train",
-
     )
     val_ds   = load_dataset("json",
         data_files=cfg["data"]["val_jsonl"],
         split="train"
     )
 
-    # ===== 模型 + 处理器（离线环境下请用本地路径 + local_files_only）=====
+    # ===== 模型 + 处理器 =====
     model, processor = load_model_and_processor(cfg)
     tune_image_processor_from_cfg(processor, cfg)
     model = apply_freeze_and_lora(model, cfg)
@@ -385,7 +391,7 @@ def main():
     auto_downscale = bool(images_cfg.get("auto_downscale_if_needed", True))
     downscale_floor = int(images_cfg.get("downscale_floor", 448))
     downscale_step  = int(images_cfg.get("downscale_step", 64))
-    prefer_short    = int(cfg.get("image_short_side", 896))  # 你 YAML 里当前是 1024
+    prefer_short    = int(cfg.get("image_short_side", 896))  # 建议 896
 
     collator = VLDataCollator(
         processor=processor,
@@ -399,7 +405,6 @@ def main():
         downscale_floor=downscale_floor,
         downscale_step=downscale_step,
     )
-
 
     # ===== 训练参数 =====
     tr_args = cfg.get("trainer", {})
