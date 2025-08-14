@@ -12,9 +12,9 @@ class VLDataCollator:
     """
     - 逐样本 encode（truncation=False）
     - 不截断视觉块；超限则按需降分
-    - pixel_values 统一：单样本 [N,C,H,W]；多样本 [B,Nmax,C,Hmax,Wmax] + pixel_values_mask
-    - image_grid_thw：单样本 torch.LongTensor[N,3]，每行 (t,h,w)，静态图 t=1
-      且 h、w 向上补成 spatial_merge_size 的倍数（满足 rot_pos_emb 的 reshape 要求）
+    - pixel_values：单样本 [N,C,H,W]；多样本 [B,Nmax,C,Hmax,Wmax] + pixel_values_mask
+    - image_grid_thw/grid_thw（单样本）：torch.LongTensor[N,3]，行=(t,h,w)，t=1
+      且 h、w 向上补为 spatial_merge_size 的倍数（最小即 spatial_merge_size，不会为 0）
     """
     def __init__(self, processor, model_config, max_length=4096,
                  add_generation_prompt=False, label_pad_token_id=-100,
@@ -34,13 +34,14 @@ class VLDataCollator:
         self.downscale_step  = int(downscale_step)
 
         tok = processor.tokenizer
+        # 这三个 id 尽量从 config 拿；fallback 仅做兜底
         self.image_token_id  = getattr(model_config, "image_token_id", tok.convert_tokens_to_ids("<|image_pad|>"))
         self.vision_start_id = getattr(model_config, "vision_start_token_id", tok.convert_tokens_to_ids("<|vision_start|>"))
         self.vision_end_id   = getattr(model_config, "vision_end_token_id",   tok.convert_tokens_to_ids("<|vision_end|>"))
 
         vc = getattr(model_config, "vision_config", None)
         self.patch_size = int(getattr(vc, "patch_size", 14)) if vc is not None else 14
-        self.spatial_merge_size = int(getattr(vc, "spatial_merge_size", 2)) if vc is not None else 2  # 关键！
+        self.spatial_merge_size = int(getattr(vc, "spatial_merge_size", 2)) if vc is not None else 2
 
         self._user_image_literal = "<image>"
         self._user_image_safe = "〈image〉"
@@ -73,7 +74,6 @@ class VLDataCollator:
             si += 1
         return blocks, total_img
 
-    # 从 enc['pixel_values'] 拿每张图 (H,W)（在我们做任何 pad 之前）
     def _extract_sizes_from_pv(self, pv):
         import torch
         sizes = []
@@ -105,28 +105,35 @@ class VLDataCollator:
             raise ValueError("pixel_values must be Tensor or list of Tensors")
         return sizes
 
-    # 把 [H,W] → (t=1, h, w)，其中 h,w 向上补为 spatial_merge_size 的倍数
     def _sizes_to_grid_tensor(self, sizes):
+        """ 把每张图 (H,W) → (t=1,h,w)，h/w ≥ m 且为 m 的倍数；绝不返回 0。"""
         import math, torch
-        p = self.patch_size
-        m = self.spatial_merge_size
-        def up_to(x, k):  # 向上补到 k 的倍数
+        p = max(1, self.patch_size)
+        m = max(1, self.spatial_merge_size)
+        def up_to(x, k):  # 向上补为 k 的倍数
+            x = max(k, int(x))           # 先保证至少为 k（避免 0/1 情况在 m=2 时非法）
             return ((x + k - 1) // k) * k
         grid = []
         for (H, W) in sizes:
+            H = max(1, int(H)); W = max(1, int(W))
             h = math.ceil(H / float(p))
             w = math.ceil(W / float(p))
             h = up_to(h, m)
             w = up_to(w, m)
-            grid.append((1, int(h), int(w)))  # 静态图 t=1
-        return torch.as_tensor(grid, dtype=torch.long)  # [N,3]
+            grid.append((1, h, w))
+        g = torch.as_tensor(grid, dtype=torch.long) if grid else torch.zeros((0,3), dtype=torch.long)
+        # 保险：再次钳制，绝不为 0
+        if g.numel():
+            g[:,1].clamp_(min=m)
+            g[:,2].clamp_(min=m)
+        return g  # shape [N,3]
 
     def __call__(self, examples):
         from PIL import Image
         import torch, math
         tok = self.processor.tokenizer
 
-        # 1) 模板 + 收集 PIL
+        # 1) 组模板 + 收集 PIL
         chats_for_template, images_batch = [], []
         for ex in examples:
             mm_tpl, imgs = [], []
@@ -156,12 +163,11 @@ class VLDataCollator:
             cur_imgs = imgs
             while True:
                 enc = self.processor(text=prompt, images=cur_imgs, padding=False, truncation=False, return_tensors="pt")
-
-                # —— 先从“原始 pixel_values”推回 grid（补到 spatial_merge_size 的倍数）
+                # 立刻回推 grid（基于“原始 pixel_values”，并补齐到 m 的倍数）
                 if "pixel_values" in enc:
                     sizes0 = self._extract_sizes_from_pv(enc["pixel_values"])
                     enc["image_sizes"] = [(int(H), int(W)) for (H, W) in sizes0]
-                    enc["image_grid_thw"] = self._sizes_to_grid_tensor(enc["image_sizes"])  # torch.LongTensor[N,3]
+                    enc["image_grid_thw"] = self._sizes_to_grid_tensor(enc["image_sizes"])  # LongTensor[N,3]
 
                 # 视觉块完整性 + 文本截断
                 ids = enc["input_ids"][0]; am = enc["attention_mask"][0]
@@ -220,7 +226,7 @@ class VLDataCollator:
         labels = input_ids.clone(); labels[attention_mask == 0] = self.label_pad_token_id
         batch = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        # 4) 统一 pixel_values；打包 grid（单样本 -> Tensor[N,3]；多样本 -> list[Tensor[Ni,3]]）
+        # 4) 统一 pixel_values；打包 grid
         def _ensure_chw(t: torch.Tensor) -> torch.Tensor:
             if t.dim() == 2: t = t.unsqueeze(0)
             elif t.dim() != 3: raise ValueError(f"image tensor must be 2D/3D, got {t.dim()}D")
@@ -256,25 +262,27 @@ class VLDataCollator:
             per_pv.append(pv)
             per_mask.append(torch.ones((pv.shape[0],), dtype=torch.bool, device=pv.device))
 
-            grid = e.get("image_grid_thw", None)  # 应该已是 torch.LongTensor[Ni,3]
+            # —— 关键：单样本的 grid 就是二维 Tensor[N,3]；绝不嵌套；且 h/w ≥ m
+            grid = e.get("image_grid_thw", None)
             if grid is None:
                 sizes0 = self._extract_sizes_from_pv(e["pixel_values"])
                 grid = self._sizes_to_grid_tensor(sizes0)
-            # 校验：grid 为二维 [Ni,3]，且 h、w 必为 spatial_merge_size 的倍数
-            assert torch.is_tensor(grid) and grid.dim() == 2 and grid.shape[1] == 3, f"grid_thw shape bad: {grid}"
+            assert torch.is_tensor(grid) and grid.dim()==2 and grid.shape[1]==3, f"grid_thw shape bad: {grid}"
             m = self.spatial_merge_size
-            assert (grid[:,1] % m == 0).all() and (grid[:,2] % m == 0).all(), f"h/w must be multiples of {m}"
-            per_grid.append(grid)  # Tensor[Ni,3]
+            # 再保险：把任何非正的 h/w 钳成 m；并校验整倍数
+            grid[:,1].clamp_(min=m); grid[:,2].clamp_(min=m)
+            assert (grid[:,1] % m == 0).all() and (grid[:,2] % m == 0).all(), "h/w must be multiples of spatial_merge_size"
+            per_grid.append(grid)
             per_sizes.append(e.get("image_sizes", self._extract_sizes_from_pv(e["pixel_values"])))
 
         if len(encoded) == 1:
-            batch["pixel_values"]       = per_pv[0]            # [N,C,H,W]
-            batch["pixel_values_mask"]  = per_mask[0]          # [N]
-            batch["image_grid_thw"]     = per_grid[0]          # Tensor[N,3] —— 单样本必须是“扁平二维”
-            batch["grid_thw"]           = batch["image_grid_thw"]  # 别名，很多实现读取这个键
-            batch["image_sizes"]        = per_sizes[0]         # list[(H,W)]
+            batch["pixel_values"]      = per_pv[0]            # [N,C,H,W]
+            batch["pixel_values_mask"] = per_mask[0]          # [N]
+            batch["image_grid_thw"]    = per_grid[0]          # LongTensor[N,3]（单样本扁平二维！）
+            batch["grid_thw"]          = batch["image_grid_thw"]
+            batch["image_sizes"]       = per_sizes[0]         # list[(H,W)]
         else:
-            # 多样本：pixel_values pad 到 5D；grid 保持逐样本 list[Tensor[Ni,3]]
+            # 多样本：pixel_values pad 到 5D；grid 逐样本 list[Tensor[Ni,3]]
             Ns = [pv.shape[0] for pv in per_pv]
             Cs = [pv.shape[1] for pv in per_pv]
             Hs = [pv.shape[2] for pv in per_pv]
@@ -293,17 +301,17 @@ class VLDataCollator:
                 pv_batch.append(pv.unsqueeze(0)); mask_batch.append(msk.unsqueeze(0))
             batch["pixel_values"]      = torch.cat(pv_batch, dim=0)
             batch["pixel_values_mask"] = torch.cat(mask_batch, dim=0)
-            batch["image_grid_thw"]    = per_grid          # list[Tensor[Ni,3]]
+            batch["image_grid_thw"]    = per_grid
             batch["grid_thw"]          = batch["image_grid_thw"]
             batch["image_sizes"]       = per_sizes
 
-        # 可选调试
+        # 调试开关：确认 grid 不会出现 0，并展示头两行
         if os.environ.get("DEBUG_GRID", "0") == "1":
             g = batch["grid_thw"]
             if torch.is_tensor(g):
-                print("GRID (tensor) shape:", tuple(g.shape), "first row:", g[0].tolist() if g.numel() else None)
+                print("GRID:", tuple(g.shape), "head:", g[:2].tolist() if g.numel() else [])
             else:
-                print("GRID (list) lens:", [x.shape for x in g])
+                print("GRID(list):", [tuple(x.shape) for x in g])
 
         return batch
 
