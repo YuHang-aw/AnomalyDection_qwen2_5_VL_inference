@@ -53,6 +53,26 @@ def load_model_and_processor(cfg) -> Tuple[torch.nn.Module, object]:
     return model, processor
 
 
+def tune_image_processor_from_cfg(processor, cfg):
+    ip = getattr(processor, "image_processor", None)
+    if ip is None:
+        return
+    short = int(cfg.get("image_short_side", 896))  # 你的 YAML 里是 1024；建议改成 896 更稳
+    # 1) 若支持“短边”
+    if hasattr(ip, "size"):
+        if isinstance(ip.size, dict) and "shortest_edge" in ip.size:
+            ip.size["shortest_edge"] = short
+        elif hasattr(ip.size, "shortest_edge"):
+            ip.size.shortest_edge = short
+    # 2) 若支持“像素面积”上下限（动态分辨率用这个更稳）
+    area = short * short
+    if hasattr(ip, "max_pixels"):
+        ip.max_pixels = area                   # 把面积顶到 short^2（≈视觉 token 上限）
+    if hasattr(ip, "min_pixels"):
+        ip.min_pixels = max(196*16, min(getattr(ip, "min_pixels", 0) or 0, area // 2))
+        # 上面这一行：下限给到 area 的一半，且不低于 ~16 个 patch（196≈14*14）
+
+
 def apply_freeze_and_lora(model, cfg):
     peft_cfg = cfg.get("peft", {})
     freeze_cfg = cfg.get("freeze", {})

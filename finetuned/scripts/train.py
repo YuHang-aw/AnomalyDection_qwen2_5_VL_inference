@@ -6,81 +6,99 @@ import torch
 from datasets import load_dataset, Features, Sequence, Value
 from transformers import TrainingArguments, Trainer, set_seed
 
-from src.modeling.load_qwen_vl import load_model_and_processor, apply_freeze_and_lora
+from src.modeling.load_qwen_vl import *
 
-# =========== 明确 schema，避免 Arrow 误判 ===========
-features = Features({
-    "messages": Sequence({
-        "role": Value("string"),
-        "content": Sequence({
-            "type":  Value("string"),
-            "text":  Value("string"),  # 若数据里有 null，建议先用修复脚本改成 ""
-            "image": Value("string"),  # 图片路径或 ""（无图）
-        })
-    })
-})
 
+# =========== Collator：模板→文本，占位→真实图片 ===========
 # =========== Collator：模板→文本，占位→真实图片 ===========
 class VLDataCollator:
     """
-    最小不定修正版：
+    最小不定修正版（接入 config）：
     - 逐样本 encode（truncation=False）
-    - 若超长：滑窗选取长度=max_length 的片段，**保证完整覆盖所有视觉块**
-    - 截断后再次校验 image_token 计数是否不变
-    - 文本里误出现 "<image>" 可选清洗为 "〈image〉"（避免干扰）
+    - 优先完整保留视觉块 <|vision_start|> ... <|vision_end|>
+    - 若超长：先做“整块保留式”文本截断；如视觉块本身超过 max_length：
+        * auto_downscale_if_needed=True → 等比例下采样，直到能塞进为止
+        * 否则报错，提示调小分辨率或调大 max_length
+    - 可选清洗用户文本中的 "<image>" 字面量为 "〈image〉"
+    - 所有关键阈值都可从 config 传入
     """
-    def __init__(self, processor, model_config, max_length=4096, add_generation_prompt=False, label_pad_token_id=-100, sanitize_user_image_token=True):
+    def __init__(
+        self,
+        processor,
+        model_config,
+        max_length=4096,
+        add_generation_prompt=False,
+        label_pad_token_id=-100,
+        sanitize_user_image_token=True,
+        # ↓↓↓ 来自配置的图像控制项
+        auto_downscale_if_needed=True,
+        prefer_short_side=None,   # 起始“短边”尝试值（例如 cfg['image_short_side']）
+        downscale_floor=448,      # 最低短边，防止无限缩
+        downscale_step=64,        # 无法从比例法推小就按步长减
+    ):
         self.processor = processor
         self.cfg = model_config
         self.max_length = int(max_length)
-        self.add_generation_prompt = bool(add_generation_prompt)  # 训练阶段建议 False
+        self.add_generation_prompt = bool(add_generation_prompt)  # 训练建议 False
         self.label_pad_token_id = int(label_pad_token_id)
         self.sanitize_user_image_token = bool(sanitize_user_image_token)
 
+        self.auto_downscale_if_needed = bool(auto_downscale_if_needed)
+        self.prefer_short_side = int(prefer_short_side) if prefer_short_side else None
+        self.downscale_floor = int(downscale_floor)
+        self.downscale_step  = int(downscale_step)
+
         tok = processor.tokenizer
-        # 从 config 读取三类关键 token id（Qwen2/2.5-VL 标准字段）
+        # Qwen2.5-VL 的视觉相关 token id（若模型未提供则用常见文本反查）
         self.image_token_id = getattr(self.cfg, "image_token_id", tok.convert_tokens_to_ids("<|image_pad|>"))
         self.vision_start_id = getattr(self.cfg, "vision_start_token_id", tok.convert_tokens_to_ids("<|vision_start|>"))
         self.vision_end_id   = getattr(self.cfg, "vision_end_token_id",   tok.convert_tokens_to_ids("<|vision_end|>"))
 
-        # 允许安全清洗用户文本里误写的 "<image>"
+        # 清洗用
         self._user_image_literal = "<image>"
         self._user_image_safe = "〈image〉"
 
+    @staticmethod
+    def _resize_keep_short(img, new_short):
+        from PIL import Image
+        w, h = img.size
+        if min(w, h) <= new_short:
+            return img
+        if w < h:
+            nw = new_short
+            nh = int(h * (new_short / w))
+        else:
+            nh = new_short
+            nw = int(w * (new_short / h))
+        return img.resize((nw, nh), Image.BICUBIC)
+
     def _find_blocks(self, ids):
-        """
-        返回所有视觉块 [start_idx, end_idx]（闭区间），并统计其中 image_token 数量。
-        若出现起止不配对，返回空列表。
-        """
+        """返回视觉块 [start, end] 闭区间列表，以及块内 image_token 计数。"""
         starts, ends = [], []
         for i, t in enumerate(ids):
             if t == self.vision_start_id: starts.append(i)
             elif t == self.vision_end_id: ends.append(i)
         if not starts and not ends:
-            return [], 0  # 无视觉块
+            return [], 0
         if len(starts) != len(ends):
-            return [], -1  # 异常
-
-        blocks = []
-        total_img_tokens = 0
+            return [], -1
+        blocks, total_img = [], 0
         si = 0
         for ei in range(len(ends)):
-            # 假设严格配对且顺序正确（Qwen 官方模板会保证）
-            s = starts[si]
-            e = ends[ei]
-            if s > e:  # 不合法
+            s, e = starts[si], ends[ei]
+            if s > e:
                 return [], -1
             blocks.append((s, e))
-            total_img_tokens += sum(1 for t in ids[s:e+1] if t == self.image_token_id)
+            total_img += sum(1 for t in ids[s:e+1] if t == self.image_token_id)
             si += 1
-        return blocks, total_img_tokens
+        return blocks, total_img
 
     def __call__(self, examples):
         from PIL import Image
-        import torch
+        import torch, math
         tok = self.processor.tokenizer
 
-        # 1) 组织模板输入：图片只放“占位”，真实 PIL 交给 processor；可选清洗用户文本里的 "<image>"
+        # 1) 组织模板输入：图片只放“占位”，真实 PIL 由 processor 处理；可选清洗 "<image>"
         chats_for_template, images_batch = [], []
         for ex in examples:
             mm_tpl, imgs = [], []
@@ -103,58 +121,72 @@ class VLDataCollator:
             chats_for_template, add_generation_prompt=self.add_generation_prompt, tokenize=False
         )
 
-        # 2) 逐样本 encode（不截断）
+        # 2) 逐样本 encode（不截断）；必要时对该样本“按需降分辨率”
         encoded = []
         for prompt, imgs in zip(prompts, images_batch):
-            enc = self.processor(text=prompt, images=imgs, padding=False, truncation=False, return_tensors="pt")
-            ids = enc["input_ids"][0]
-            am  = enc["attention_mask"][0]
-            ids_list = ids.tolist()
+            try_short = self.prefer_short_side or 896  # 起步短边（可从 cfg['image_short_side'] 传入）
+            cur_imgs = imgs
 
-            # 2.1 定位视觉块并统计 image_token（原始计数）
-            blocks, img_tok_cnt = self._find_blocks(ids_list)
-            if img_tok_cnt < 0:
-                raise ValueError("Malformed vision token blocks in encoded input; check template & data.")
-            # —— 注意：这里**不再**用“文本里数占位符”的办法，因为 Qwen2.5-VL 一图 = 多个 image_token
-
-            # 3) 超长则“视觉块优先保留”式截断
-            L = ids.shape[-1]
-            if L > self.max_length and blocks:
-                # 需要一个窗口 [left, right) 长度为 max_length，完全覆盖所有视觉块
-                min_keep = min(s for s, _ in blocks)
-                max_keep = max(e for _, e in blocks) + 1  # 右开
-                need = max_keep - min_keep
-                if need > self.max_length:
-                    # 单是视觉块就超过了 max_length —— 上游必须缩短文本或下调分辨率
-                    raise ValueError(
-                        f"Visual token span ({need}) > max_length ({self.max_length}). "
-                        f"Reduce text or set smaller image pixels (min/max_pixels)."
-                    )
-                # 优先尽量保留尾部的对话；先给出一个候选左界
-                left = max(0, L - self.max_length)
-                # 确保窗口覆盖视觉块
-                if left > min_keep:
-                    left = min_keep
-                if left + self.max_length < max_keep:
-                    left = max(0, max_keep - self.max_length)
-                right = left + self.max_length
-                ids = ids[left:right]
-                am  = am[left:right]
+            while True:
+                enc = self.processor(text=prompt, images=cur_imgs, padding=False, truncation=False, return_tensors="pt")
+                ids = enc["input_ids"][0]
+                am  = enc["attention_mask"][0]
                 ids_list = ids.tolist()
 
-                # 3.1 截断后再次统计 image_token，必须与截断前一致
-                _, img_tok_cnt_after = self._find_blocks(ids_list)
-                if img_tok_cnt_after != img_tok_cnt:
+                blocks, _img_tok_cnt = self._find_blocks(ids_list)
+                if _img_tok_cnt < 0:
+                    raise ValueError("Malformed vision token blocks in encoded input; check template & data.")
+
+                L = ids.shape[-1]
+                if blocks:
+                    min_keep = min(s for s, _ in blocks)
+                    max_keep = max(e for _, e in blocks) + 1
+                    need = max_keep - min_keep
+                else:
+                    min_keep = 0
+                    max_keep = 0
+                    need = 0
+
+                # 2.1 视觉块能放下 → 如整体仍超长，做“整块保留式”文本截断
+                if need <= self.max_length:
+                    if L > self.max_length and blocks:
+                        left = max(0, L - self.max_length)  # 优先保尾
+                        if left > min_keep: left = min_keep  # 不能切断第一块视觉
+                        if left + self.max_length < max_keep:
+                            left = max(0, max_keep - self.max_length)
+                        ids = ids[left:left+self.max_length]
+                        am  = am[left:left+self.max_length]
+                        enc["input_ids"] = ids.unsqueeze(0)
+                        enc["attention_mask"] = am.unsqueeze(0)
+                    break  # 这条样本 OK
+
+                # 2.2 视觉块本身 > max_length
+                if not self.auto_downscale_if_needed:
                     raise ValueError(
-                        "Unsafe truncation removed part of visual tokens. Increase max_length, "
-                        "shorten text, or reduce image pixels."
+                        f"Visual token span ({need}) > max_length ({self.max_length}). "
+                        f"Set a smaller image size (e.g., image_short_side=896) or enable auto_downscale_if_needed."
                     )
-                enc["input_ids"] = ids.unsqueeze(0)
-                enc["attention_mask"] = am.unsqueeze(0)
+
+                # 按需下采样：估算缩放比例，把 need 压到 95% budget
+                scale = math.sqrt(self.max_length / need) * 0.95
+                new_short = max(self.downscale_floor, int(try_short * scale))
+                if new_short >= try_short:
+                    new_short = max(self.downscale_floor, try_short - self.downscale_step)
+
+                if new_short < self.downscale_floor or new_short == try_short:
+                    raise ValueError(
+                        f"Even after planned downscaling (floor={self.downscale_floor}), "
+                        f"visual span ({need}) > max_length ({self.max_length}). "
+                        f"建议：把 image_short_side 调到 896/672，或提高 max_length（若模型支持）。"
+                    )
+
+                # 真的缩图再重编一次
+                cur_imgs = [self._resize_keep_short(im, new_short) for im in cur_imgs]
+                try_short = new_short
 
             encoded.append(enc)
 
-        # 4) 右侧 padding 成 batch，并生成 labels（pad→-100）
+        # 3) 右侧 padding → batch，labels 的 padding 置 -100
         max_len = max(e["input_ids"].shape[-1] for e in encoded)
         pad_id = tok.pad_token_id
         input_ids_list, attn_list = [], []
@@ -175,18 +207,18 @@ class VLDataCollator:
 
         batch = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        # 5) pixel_values（若存在）直接带上
+        # 4) pixel_values（若存在）带上
         if "pixel_values" in encoded[0]:
             if len(encoded) == 1:
                 batch["pixel_values"] = encoded[0]["pixel_values"]
             else:
                 try:
-                    import torch
                     batch["pixel_values"] = torch.stack([e["pixel_values"] for e in encoded], dim=0)
                 except Exception:
                     batch["pixel_values"] = [e["pixel_values"] for e in encoded]
 
         return batch
+
 
 
 
@@ -207,24 +239,38 @@ def main():
     train_ds = load_dataset("json",
         data_files=cfg["data"]["train_jsonl"],
         split="train",
-        features=features
+
     )
     val_ds   = load_dataset("json",
         data_files=cfg["data"]["val_jsonl"],
-        split="train",
-        features=features
+        split="train"
     )
 
     # ===== 模型 + 处理器（离线环境下请用本地路径 + local_files_only）=====
     model, processor = load_model_and_processor(cfg)
+    tune_image_processor_from_cfg(processor, cfg)
     model = apply_freeze_and_lora(model, cfg)
 
     # ===== Collator 实例 =====
+    max_seq_len = int(cfg.get("max_seq_len", 4096))
+    sanitize_image_literal = bool(cfg.get("data", {}).get("sanitize_image_literal", True))
+    images_cfg = cfg.get("images", {})  # 可选区块，无则走默认
+    auto_downscale = bool(images_cfg.get("auto_downscale_if_needed", True))
+    downscale_floor = int(images_cfg.get("downscale_floor", 448))
+    downscale_step  = int(images_cfg.get("downscale_step", 64))
+    prefer_short    = int(cfg.get("image_short_side", 896))  # 你 YAML 里当前是 1024
+
     collator = VLDataCollator(
         processor=processor,
         model_config=model.config,
-        max_length=4096,                # 保证 ≥ 文本tokens + 全部视觉tokens
-        add_generation_prompt=False     # 训练阶段固定 False
+        max_length=max_seq_len,
+        add_generation_prompt=False,               # 训练固定 False
+        label_pad_token_id=-100,
+        sanitize_user_image_token=sanitize_image_literal,
+        auto_downscale_if_needed=auto_downscale,
+        prefer_short_side=prefer_short,
+        downscale_floor=downscale_floor,
+        downscale_step=downscale_step,
     )
 
 
@@ -242,7 +288,7 @@ def main():
         bf16=(cfg.get("precision","bf16").lower()=="bf16"),
         fp16=(cfg.get("precision","bf16").lower()=="fp16"),
         gradient_checkpointing=cfg["optim"].get("grad_checkpointing", False),
-        eva_strategy=tr_args.get("evaluation_strategy","steps"),
+        eval_strategy=tr_args.get("evaluation_strategy","steps"),
         eval_steps=tr_args.get("eval_steps",200),
         save_strategy=tr_args.get("save_strategy","steps"),
         save_steps=tr_args.get("save_steps",200),
