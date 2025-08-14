@@ -10,10 +10,10 @@ from src.modeling.load_qwen_vl import *
 
 class VLDataCollator:
     """
-    最终修正版 v4:
-    - 修复了 `ValueError: The truth value of a Tensor... is ambiguous` 错误。
-    - 正确计算 N_max (batch内单个样本的最大图片数)，避免对 Tensor 使用 `any()`。
-    - 保留了 v3 的核心逻辑：完全信任 processor 的输出，正确打包 grid_thw 和 grid_idx。
+    最终修正版 v5:
+    - 修复了 `IndexError: tuple index out of range` 错误。
+    - 在计算 padding 长度时，对 1D 张量使用 `ids.shape[0]` 而不是 `ids.shape[1]`。
+    - 保留了 v4 的所有正确逻辑：信任 processor、正确打包视觉部分、右填充。
     """
     def __init__(self, processor, model_config, max_length=4096,
                  add_generation_prompt=False, label_pad_token_id=-100,
@@ -76,7 +76,7 @@ class VLDataCollator:
             chats_for_template, add_generation_prompt=self.add_generation_prompt, tokenize=False
         )
 
-        # 2) 逐样本 encode，并收集 processor 的输出
+        # 2) 逐样本 encode
         encoded_samples = []
         for prompt, imgs in zip(prompts, images_batch):
             try_short = self.prefer_short_side or 896
@@ -103,7 +103,10 @@ class VLDataCollator:
         batch_input_ids, batch_attention_mask = [], []
         for enc in encoded_samples:
             ids, am = enc["input_ids"][0], enc["attention_mask"][0]
-            pad_n = max_len - ids.shape[1]
+            
+            # 关键修正: 对 1D 张量使用 shape[0]
+            pad_n = max_len - ids.shape[0]
+            
             if pad_n > 0:
                 ids = torch.nn.functional.pad(ids, (0, pad_n), value=self.pad_token_id)
                 am  = torch.nn.functional.pad(am,  (0, pad_n), value=0)
@@ -116,12 +119,11 @@ class VLDataCollator:
         labels[attention_mask == 0] = self.label_pad_token_id
         batch = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        # 4) 视觉部分打包 (pixel_values, grid_thw, grid_idx)
+        # 4) 视觉部分打包
         per_pv = [enc.get('pixel_values') for enc in encoded_samples]
         per_grid_thw = [enc.get('image_grid_thw') for enc in encoded_samples]
         per_grid_idx = [enc.get('image_grid_idx') for enc in encoded_samples]
 
-        # 关键修正: 正确计算 N_max
         image_counts = [
             pv.shape[1] 
             for pv in per_pv 
@@ -134,7 +136,7 @@ class VLDataCollator:
             W_max = max(pv.shape[4] for pv in per_pv if pv is not None and pv.numel() > 0)
             C = next(pv.shape[2] for pv in per_pv if pv is not None and pv.numel() > 0)
             
-            pv_batch = torch.zeros((len(examples), N_max, C, H_max, W_max), dtype=per_pv[0].dtype)
+            pv_batch = torch.zeros((len(examples), N_max, C, H_max, W_max), dtype=torch.bfloat16 if self.processor.image_processor.torch_dtype == torch.bfloat16 else torch.float16)
             pv_mask = torch.zeros((len(examples), N_max), dtype=torch.bool)
             
             for i, pv in enumerate(per_pv):
