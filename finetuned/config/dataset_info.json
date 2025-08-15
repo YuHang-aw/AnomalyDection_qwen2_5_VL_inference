@@ -1,0 +1,12 @@
+{
+  "roi_train": {
+    "file_name": "roi_train.jsonl",
+    "formatting": "sharegpt",
+    "columns": { "messages": "conversations", "images": "images" }
+  },
+  "roi_val": {
+    "file_name": "roi_val.jsonl",
+    "formatting": "sharegpt",
+    "columns": { "messages": "conversations", "images": "images" }
+  }
+}
