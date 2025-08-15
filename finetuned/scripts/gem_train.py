@@ -10,11 +10,11 @@ from src.modeling.load_qwen_vl import *
 
 class VLDataCollator:
     """
-    最终健壮版 (v6):
-    - 核心修正：增加了对 processor 输出的防御性检查。
-    - 在将样本加入 batch 之前，验证 processor 生成的 `pixel_values` 是否有效且非空。
-    - 如果 `pixel_values` 无效，则丢弃该损坏的样本，防止其污染 batch 并导致模型崩溃。
-    - 这是处理上游数据边缘情况（如无效的裁切图）的最根本、最可靠的方法。
+    最终正确且健壮版 (v8):
+    - 核心修正：增加了对 processor 输出张量的“维度规范化”处理。
+    - 解决了 processor 可能返回 4D [B,C,H,W] 或 5D [B,N,C,H,W] 张量的不一致问题。
+    - 在处理前，强制将所有 4D pixel_values 转换为 5D [B,1,C,H,W]，使后续逻辑统一健壮。
+    - 这是应对 processor 动态行为的最终解决方案，彻底杜绝因维度不匹配导致的 IndexError。
     """
     def __init__(self, processor, model_config, max_length=4096,
                  add_generation_prompt=False, label_pad_token_id=-100,
@@ -57,7 +57,6 @@ class VLDataCollator:
         valid_encoded_samples = []
         
         for ex in examples:
-            # 1) 加载文本和图像
             mm_tpl, imgs = [], []
             has_valid_image = False
             for m in ex["messages"]:
@@ -66,65 +65,51 @@ class VLDataCollator:
                     if p["type"] == "image" and p.get("image"):
                         try:
                             img = Image.open(p["image"]).convert("RGB")
-                            # 增加一个基本的尺寸检查
                             if img.width > 1 and img.height > 1:
                                 parts_tpl.append({"type": "image"})
                                 imgs.append(img)
                                 has_valid_image = True
-                            else:
-                                print(f"Warning: Skipping degenerate image {p['image']} with size {img.size}")
-                        except Exception as e:
-                            print(f"Warning: Could not open image {p['image']}, skipping. Error: {e}")
+                        except Exception:
+                            pass # Silently skip invalid images
                     else:
                         txt = (p.get("text") or "")
-                        if self.sanitize_user_image_token and self._user_image_literal in txt:
-                            txt = txt.replace(self._user_image_literal, self._user_image_safe)
+                        if self.sanitize_user_image_token: txt = txt.replace(self._user_image_literal, self._user_image_safe)
                         parts_tpl.append({"type": "text", "text": txt})
                 mm_tpl.append({"role": m["role"], "content": parts_tpl})
 
-            if not has_valid_image:
-                continue # 如果这个样本的所有图片都无效，则直接跳过
+            if not has_valid_image: continue
 
-            prompt = self.processor.apply_chat_template(
-                [mm_tpl], add_generation_prompt=self.add_generation_prompt, tokenize=False
-            )[0]
+            prompt = self.processor.apply_chat_template([mm_tpl], add_generation_prompt=self.add_generation_prompt, tokenize=False)[0]
 
-            # 2) Encode 并进行防御性检查
             try_short = self.prefer_short_side or 896
             cur_imgs = imgs
             while True:
                 enc = self.processor(text=prompt, images=cur_imgs, padding=False, truncation=False, return_tensors="pt")
                 
-                # --- 核心防御性检查 ---
                 pv = enc.get("pixel_values")
                 if pv is None or pv.numel() == 0:
-                    print(f"Warning: Processor produced empty pixel_values. Skipping sample.")
-                    enc = None # 标记为无效
-                    break 
-                
+                    enc = None; break 
+
+                # --- 核心修正：维度规范化 ---
+                if pv.dim() == 4:
+                    # 如果是 [B, C, H, W]，则 unsqueeze 成 [B, 1, C, H, W]
+                    pv = pv.unsqueeze(1)
+                    enc['pixel_values'] = pv
+                # -------------------------
+
                 L = enc["input_ids"].shape[1]
-                if L <= self.max_length:
-                    break # 成功
-                if not self.auto_downscale_if_needed:
-                    print(f"Warning: Sequence length ({L}) > max_length ({self.max_length}). Skipping sample.")
-                    enc = None # 标记为无效
-                    break
-                
+                if L <= self.max_length: break
+                if not self.auto_downscale_if_needed: enc = None; break
                 scale = math.sqrt(self.max_length / L) * 0.95
                 new_short = max(self.downscale_floor, int(try_short * scale))
                 if new_short >= try_short: new_short = max(self.downscale_floor, try_short - self.downscale_step)
-                if new_short < self.downscale_floor or new_short == try_short:
-                    print(f"Warning: Downscaling failed. Skipping sample.")
-                    enc = None # 标记为无效
-                    break
+                if new_short < self.downscale_floor or new_short == try_short: enc = None; break
                 cur_imgs = [self._resize_keep_short(im, new_short) for im in cur_imgs]
                 try_short = new_short
             
-            if enc:
-                valid_encoded_samples.append(enc)
+            if enc: valid_encoded_samples.append(enc)
 
-        if not valid_encoded_samples:
-            return {} # 如果整个 batch 的样本都无效，则跳过
+        if not valid_encoded_samples: return {}
 
         # 3) 文本右填充 + labels
         max_len = max(e["input_ids"].shape[1] for e in valid_encoded_samples)
@@ -144,18 +129,43 @@ class VLDataCollator:
         labels[attention_mask == 0] = self.label_pad_token_id
         batch = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        # 4) 视觉部分打包
-        per_pv = [enc.get('pixel_values') for enc in valid_encoded_samples]
-        batch["pixel_values"] = torch.cat(per_pv, dim=0)
+        # 4) 视觉部分打包 (现在可以安全地假设所有张量都是5D)
+        num_valid_samples = len(valid_encoded_samples)
         
-        per_grid_thw = [enc.get('image_grid_thw') for enc in valid_encoded_samples]
-        per_grid_idx = [enc.get('image_grid_idx') for enc in valid_encoded_samples]
+        num_tiles_per_sample = [e['pixel_values'].shape[1] for e in valid_encoded_samples]
+        N_max = max(num_tiles_per_sample)
+        H_max = max(e['pixel_values'].shape[3] for e in valid_encoded_samples)
+        W_max = max(e['pixel_values'].shape[4] for e in valid_encoded_samples)
+        C = valid_encoded_samples[0]['pixel_values'].shape[2]
+        dtype = valid_encoded_samples[0]['pixel_values'].dtype
+
+        pv_batch = torch.zeros((num_valid_samples, N_max, C, H_max, W_max), dtype=dtype)
+        for i, enc in enumerate(valid_encoded_samples):
+            pv = enc['pixel_values'][0]
+            N, _, H, W = pv.shape
+            pv_batch[i, :N, :, :H, :W] = pv
+        batch['pixel_values'] = pv_batch
+
+        flat_grids, padded_indices = [], []
+        idx_offset = 0
+        for i, enc in enumerate(valid_encoded_samples):
+            grid = enc['image_grid_thw']
+            flat_grids.append(grid)
+            idx = enc['image_grid_idx'][0] + idx_offset
+            padded_indices.append(idx)
+            idx_offset += num_tiles_per_sample[i]
+
+        batch['grid_thw'] = torch.cat(flat_grids, dim=0)
         
-        batch["grid_thw"] = torch.cat(per_grid_thw, dim=0)
-        batch["image_grid_idx"] = torch.arange(len(valid_encoded_samples)).unsqueeze(-1)
-        batch["image_grid_thw"] = batch["grid_thw"]
+        idx_batch = torch.zeros((num_valid_samples, N_max), dtype=torch.long)
+        for i, idx in enumerate(padded_indices):
+            idx_batch[i, :len(idx)] = idx
+        batch['image_grid_idx'] = idx_batch
+        
+        batch['image_grid_thw'] = batch['grid_thw']
 
         return batch
+
 
 def main():
     ap = argparse.ArgumentParser()
