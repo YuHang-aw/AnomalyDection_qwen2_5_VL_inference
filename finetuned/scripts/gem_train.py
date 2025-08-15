@@ -59,42 +59,38 @@ class VLDataCollator:
         import math, torch
         pv = enc["pixel_values"]
 
-        # 情况 1：已经是 [B, N, C, H, W] → 直接用
+        # 情况 A: [B, N, C, H, W] -> 直接用
         if pv.dim() == 5:
             pass
 
-        # 情况 2：[N, C, H, W]（无 batch 维，有 tile）
+        # 情况 B: [N, C, H, W]（无 batch 维，有 tile）
         elif pv.dim() == 4 and "image_grid_thw" in enc and enc["image_grid_thw"].shape[0] == pv.shape[0]:
-            # 补 batch 维到前面
-            pv = pv.unsqueeze(0)        # [1, N, C, H, W]
+            pv = pv.unsqueeze(0)  # [1, N, C, H, W]
             enc["pixel_values"] = pv
-            # 有些实现没给 idx，就自己做一个 [1, N] = [0..N-1]
             if "image_grid_idx" not in enc:
                 N = pv.shape[1]
                 enc["image_grid_idx"] = torch.arange(N, dtype=torch.long).unsqueeze(0)
 
-        # 情况 3：[B, C, H, W]（常见是 B=1，无 tile）
+        # 情况 C: [B, C, H, W]（常见 B=1，无 tile）
         elif pv.dim() == 4:
             B, C, H, W = pv.shape
-            # 变成 [B, 1, C, H, W]
-            pv = pv.unsqueeze(1)
+            pv = pv.unsqueeze(1)  # [B, 1, C, H, W]
             enc["pixel_values"] = pv
-            # 如果 processor 没给 grid，就自己构造“安全”的：ceil，并且凑成偶数，保证 2x2 merge
             if "image_grid_thw" not in enc:
                 hp = math.ceil(H / self.patch_size)
                 wp = math.ceil(W / self.patch_size)
+                # 为 2×2 merge，取偶
                 if hp % 2: hp += 1
                 if wp % 2: wp += 1
                 enc["image_grid_thw"] = torch.tensor([[1, hp, wp]], dtype=torch.long)
             if "image_grid_idx" not in enc:
                 enc["image_grid_idx"] = torch.tensor([[0]], dtype=torch.long)
 
-        # 情况 4：[C, H, W]（极少见，但要兜底）
+        # 情况 D: [C, H, W]（极少见）
         elif pv.dim() == 3:
             C, H, W = pv.shape
             pv = pv.unsqueeze(0).unsqueeze(0)  # [1,1,C,H,W]
             enc["pixel_values"] = pv
-            import math
             hp = math.ceil(H / self.patch_size)
             wp = math.ceil(W / self.patch_size)
             if hp % 2: hp += 1
@@ -106,6 +102,7 @@ class VLDataCollator:
             raise ValueError(f"Unexpected pixel_values shape: {pv.shape}")
 
         return enc
+
 
     def __call__(self, examples):
         from PIL import Image
@@ -141,9 +138,9 @@ class VLDataCollator:
             try_short = self.prefer_short_side or 896
             cur_imgs = imgs
             while True:
-                enc = self._normalize_enc(enc)
-                enc = self.processor(text=prompt, images=cur_imgs, padding=False, truncation=False, return_tensors="pt")
                 
+                enc = self.processor(text=prompt, images=cur_imgs, padding=False, truncation=False, return_tensors="pt")
+                enc = self._normalize_enc(enc)
                 pv = enc.get("pixel_values")
                 if pv is None or pv.numel() == 0:
                     enc = None; break 
