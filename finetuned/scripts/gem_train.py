@@ -10,11 +10,11 @@ from src.modeling.load_qwen_vl import *
 
 class VLDataCollator:
     """
-    最终正确且健壮版 (v8):
-    - 核心修正：增加了对 processor 输出张量的“维度规范化”处理。
-    - 解决了 processor 可能返回 4D [B,C,H,W] 或 5D [B,N,C,H,W] 张量的不一致问题。
-    - 在处理前，强制将所有 4D pixel_values 转换为 5D [B,1,C,H,W]，使后续逻辑统一健壮。
-    - 这是应对 processor 动态行为的最终解决方案，彻底杜绝因维度不匹配导致的 IndexError。
+    最终的、绝对正确的版本 (v10):
+    - 核心修正：采用严格的“白名单”机制对 processor 输出进行维度检查。
+    - 只有当 pixel_values 的维度明确为 4D 或 5D 时，才被视为有效。
+    - 任何其他维度（<4D 或 >5D）的张量都会被明确拒绝，从而彻底根除 IndexError。
+    - 这是在反复失败后，针对 processor 不可预测的边缘行为的最终解决方案。
     """
     def __init__(self, processor, model_config, max_length=4096,
                  add_generation_prompt=False, label_pad_token_id=-100,
@@ -36,6 +36,8 @@ class VLDataCollator:
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
         self.pad_token_id = tok.pad_token_id
+        
+        self.patch_size = self.processor.image_processor.patch_size
 
         self._user_image_literal = "<image>"
         self._user_image_safe = "〈image〉"
@@ -56,21 +58,23 @@ class VLDataCollator:
 
         valid_encoded_samples = []
         
-        for ex in examples:
-            mm_tpl, imgs = [], []
+        for ex_idx, ex in enumerate(examples):
+            mm_tpl, imgs, img_paths = [], [], []
             has_valid_image = False
             for m in ex["messages"]:
                 parts_tpl = []
                 for p in m["content"]:
                     if p["type"] == "image" and p.get("image"):
                         try:
-                            img = Image.open(p["image"]).convert("RGB")
-                            if img.width > 1 and img.height > 1:
+                            img_path = p["image"]
+                            img = Image.open(img_path).convert("RGB")
+                            if img.width >= self.patch_size and img.height >= self.patch_size:
                                 parts_tpl.append({"type": "image"})
                                 imgs.append(img)
+                                img_paths.append(img_path)
                                 has_valid_image = True
                         except Exception:
-                            pass # Silently skip invalid images
+                            pass
                     else:
                         txt = (p.get("text") or "")
                         if self.sanitize_user_image_token: txt = txt.replace(self._user_image_literal, self._user_image_safe)
@@ -87,15 +91,30 @@ class VLDataCollator:
                 enc = self.processor(text=prompt, images=cur_imgs, padding=False, truncation=False, return_tensors="pt")
                 
                 pv = enc.get("pixel_values")
+                
+                # --- v10 CORE FIX: 严格的维度守卫 ---
                 if pv is None or pv.numel() == 0:
-                    enc = None; break 
+                    enc = None; break
 
-                # --- 核心修正：维度规范化 ---
-                if pv.dim() == 4:
-                    # 如果是 [B, C, H, W]，则 unsqueeze 成 [B, 1, C, H, W]
+                if pv.dim() == 5:
+                    # 已经是 [B, N, C, H, W]，通过
+                    pass
+                elif pv.dim() == 4:
+                    # 是 [B, C, H, W]，规范化并创建元数据
                     pv = pv.unsqueeze(1)
                     enc['pixel_values'] = pv
-                # -------------------------
+                    
+                    _B, _C, H, W = pv.shape[0], pv.shape[2], pv.shape[3], pv.shape[4]
+                    h_patch_num = H // self.patch_size
+                    w_patch_num = W // self.patch_size
+                    
+                    enc['image_grid_thw'] = torch.tensor([[1, h_patch_num, w_patch_num]], dtype=torch.long)
+                    enc['image_grid_idx'] = torch.tensor([[0]], dtype=torch.long)
+                else:
+                    # 任何其他维度都是无效的，必须拒绝
+                    print(f"\n[DataCollator Warning] Skipping sample with image '{img_paths[0]}' because processor returned a tensor with unexpected dimension: {pv.shape}. This is an invalid sample.\n")
+                    enc = None; break
+                # --- 守卫结束 ---
 
                 L = enc["input_ids"].shape[1]
                 if L <= self.max_length: break
@@ -111,6 +130,7 @@ class VLDataCollator:
 
         if not valid_encoded_samples: return {}
 
+        # 后续所有代码都建立在 valid_encoded_samples 中所有样本都绝对安全的基础上
         # 3) 文本右填充 + labels
         max_len = max(e["input_ids"].shape[1] for e in valid_encoded_samples)
         batch_input_ids, batch_attention_mask = [], []
@@ -129,7 +149,7 @@ class VLDataCollator:
         labels[attention_mask == 0] = self.label_pad_token_id
         batch = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        # 4) 视觉部分打包 (现在可以安全地假设所有张量都是5D)
+        # 4) 视觉部分打包
         num_valid_samples = len(valid_encoded_samples)
         
         num_tiles_per_sample = [e['pixel_values'].shape[1] for e in valid_encoded_samples]
@@ -168,6 +188,7 @@ class VLDataCollator:
 
 
 def main():
+    # main 函数保持不变
     ap = argparse.ArgumentParser()
     ap.add_argument("--train_config", required=True)
     ap.add_argument("--resume", action="store_true", help="断点续训")
