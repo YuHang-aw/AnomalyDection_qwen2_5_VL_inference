@@ -10,12 +10,11 @@ from src.modeling.load_qwen_vl import *
 
 class VLDataCollator:
     """
-    最终正确版 (v7):
-    - 结合了所有经验：保持 ROI 裁切思路和防御性样本检查。
-    - 核心修正：完全信任并正确整理 processor 返回的视觉元数据。
-    - 解决了因 processor 动态切分图块（tiling）而导致的元数据不匹配问题。
-    - 正确地为每个 batch 构建扁平化的 `grid_thw` 和带偏移量的 `image_grid_idx`，
-      确保与模型内部期望完全一致，从根本上解决 reshape 错误。
+    最终健壮版 (v6):
+    - 核心修正：增加了对 processor 输出的防御性检查。
+    - 在将样本加入 batch 之前，验证 processor 生成的 `pixel_values` 是否有效且非空。
+    - 如果 `pixel_values` 无效，则丢弃该损坏的样本，防止其污染 batch 并导致模型崩溃。
+    - 这是处理上游数据边缘情况（如无效的裁切图）的最根本、最可靠的方法。
     """
     def __init__(self, processor, model_config, max_length=4096,
                  add_generation_prompt=False, label_pad_token_id=-100,
@@ -58,6 +57,7 @@ class VLDataCollator:
         valid_encoded_samples = []
         
         for ex in examples:
+            # 1) 加载文本和图像
             mm_tpl, imgs = [], []
             has_valid_image = False
             for m in ex["messages"]:
@@ -66,6 +66,7 @@ class VLDataCollator:
                     if p["type"] == "image" and p.get("image"):
                         try:
                             img = Image.open(p["image"]).convert("RGB")
+                            # 增加一个基本的尺寸检查
                             if img.width > 1 and img.height > 1:
                                 parts_tpl.append({"type": "image"})
                                 imgs.append(img)
@@ -76,34 +77,54 @@ class VLDataCollator:
                             print(f"Warning: Could not open image {p['image']}, skipping. Error: {e}")
                     else:
                         txt = (p.get("text") or "")
-                        if self.sanitize_user_image_token: txt = txt.replace(self._user_image_literal, self._user_image_safe)
+                        if self.sanitize_user_image_token and self._user_image_literal in txt:
+                            txt = txt.replace(self._user_image_literal, self._user_image_safe)
                         parts_tpl.append({"type": "text", "text": txt})
                 mm_tpl.append({"role": m["role"], "content": parts_tpl})
 
-            if not has_valid_image: continue
+            if not has_valid_image:
+                continue # 如果这个样本的所有图片都无效，则直接跳过
 
-            prompt = self.processor.apply_chat_template([mm_tpl], add_generation_prompt=self.add_generation_prompt, tokenize=False)[0]
+            prompt = self.processor.apply_chat_template(
+                [mm_tpl], add_generation_prompt=self.add_generation_prompt, tokenize=False
+            )[0]
 
+            # 2) Encode 并进行防御性检查
             try_short = self.prefer_short_side or 896
             cur_imgs = imgs
             while True:
                 enc = self.processor(text=prompt, images=cur_imgs, padding=False, truncation=False, return_tensors="pt")
+                
+                # --- 核心防御性检查 ---
                 pv = enc.get("pixel_values")
                 if pv is None or pv.numel() == 0:
-                    enc = None; break 
+                    print(f"Warning: Processor produced empty pixel_values. Skipping sample.")
+                    enc = None # 标记为无效
+                    break 
+                
                 L = enc["input_ids"].shape[1]
-                if L <= self.max_length: break
-                if not self.auto_downscale_if_needed: enc = None; break
+                if L <= self.max_length:
+                    break # 成功
+                if not self.auto_downscale_if_needed:
+                    print(f"Warning: Sequence length ({L}) > max_length ({self.max_length}). Skipping sample.")
+                    enc = None # 标记为无效
+                    break
+                
                 scale = math.sqrt(self.max_length / L) * 0.95
                 new_short = max(self.downscale_floor, int(try_short * scale))
                 if new_short >= try_short: new_short = max(self.downscale_floor, try_short - self.downscale_step)
-                if new_short < self.downscale_floor or new_short == try_short: enc = None; break
+                if new_short < self.downscale_floor or new_short == try_short:
+                    print(f"Warning: Downscaling failed. Skipping sample.")
+                    enc = None # 标记为无效
+                    break
                 cur_imgs = [self._resize_keep_short(im, new_short) for im in cur_imgs]
                 try_short = new_short
             
-            if enc: valid_encoded_samples.append(enc)
+            if enc:
+                valid_encoded_samples.append(enc)
 
-        if not valid_encoded_samples: return {}
+        if not valid_encoded_samples:
+            return {} # 如果整个 batch 的样本都无效，则跳过
 
         # 3) 文本右填充 + labels
         max_len = max(e["input_ids"].shape[1] for e in valid_encoded_samples)
@@ -123,54 +144,18 @@ class VLDataCollator:
         labels[attention_mask == 0] = self.label_pad_token_id
         batch = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        # 4) 视觉部分打包 (最关键的修正)
-        num_valid_samples = len(valid_encoded_samples)
+        # 4) 视觉部分打包
+        per_pv = [enc.get('pixel_values') for enc in valid_encoded_samples]
+        batch["pixel_values"] = torch.cat(per_pv, dim=0)
         
-        # 4.1) 找出每个样本的图块数，以及最大的图块数、H、W
-        num_tiles_per_sample = [e['pixel_values'].shape[1] for e in valid_encoded_samples]
-        N_max = max(num_tiles_per_sample)
-        H_max = max(e['pixel_values'].shape[3] for e in valid_encoded_samples)
-        W_max = max(e['pixel_values'].shape[4] for e in valid_encoded_samples)
-        C = valid_encoded_samples[0]['pixel_values'].shape[2]
-        dtype = valid_encoded_samples[0]['pixel_values'].dtype
-
-        # 4.2) Pad pixel_values
-        pv_batch = torch.zeros((num_valid_samples, N_max, C, H_max, W_max), dtype=dtype)
-        for i, enc in enumerate(valid_encoded_samples):
-            pv = enc['pixel_values'][0] # Shape: [N, C, H, W]
-            N, _, H, W = pv.shape
-            pv_batch[i, :N, :, :H, :W] = pv
-        batch['pixel_values'] = pv_batch
-
-        # 4.3) 合并 grid_thw 和 image_grid_idx (核心逻辑)
-        flat_grids, padded_indices = [], []
-        idx_offset = 0
+        per_grid_thw = [enc.get('image_grid_thw') for enc in valid_encoded_samples]
+        per_grid_idx = [enc.get('image_grid_idx') for enc in valid_encoded_samples]
         
-        for i, enc in enumerate(valid_encoded_samples):
-            # grid_thw from processor is [N, 3]
-            grid = enc['image_grid_thw']
-            flat_grids.append(grid)
-            
-            # image_grid_idx from processor is [1, N]
-            # It contains indices relative to the start of *this sample's* tiles.
-            # We must add the offset of previous samples' tiles.
-            idx = enc['image_grid_idx'][0] + idx_offset
-            padded_indices.append(idx)
-            
-            idx_offset += num_tiles_per_sample[i]
-
-        batch['grid_thw'] = torch.cat(flat_grids, dim=0)
-        
-        idx_batch = torch.zeros((num_valid_samples, N_max), dtype=torch.long)
-        for i, idx in enumerate(padded_indices):
-            idx_batch[i, :len(idx)] = idx
-        batch['image_grid_idx'] = idx_batch
-        
-        # 兼容别名
-        batch['image_grid_thw'] = batch['grid_thw']
+        batch["grid_thw"] = torch.cat(per_grid_thw, dim=0)
+        batch["image_grid_idx"] = torch.arange(len(valid_encoded_samples)).unsqueeze(-1)
+        batch["image_grid_thw"] = batch["grid_thw"]
 
         return batch
-
 
 def main():
     ap = argparse.ArgumentParser()
