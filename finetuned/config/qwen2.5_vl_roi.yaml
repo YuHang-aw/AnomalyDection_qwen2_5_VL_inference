@@ -1,0 +1,48 @@
+# 基础
+model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct
+template: qwen2_vl               # LLaMA-Factory 内置模板
+finetuning_type: lora            # 或 full / freeze (不推荐)
+flash_attn: fa2
+torch_dtype: bfloat16
+gradient_checkpointing: true
+
+# 数据
+dataset: roi_train
+val_dataset: roi_val
+dataset_dir: ./data
+max_samples: null
+preprocessing_batch_size: 1      # 多模态推荐小点，避免预处理阻塞
+cutoff_len: 4096                 # 文本上限
+
+# 训练
+output_dir: ./runs/roi_phase1
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 8
+num_train_epochs: 2
+learning_rate: 1.0e-4            # 官方 qwen2vl lora 配方常见设置，按需调。
+weight_decay: 0.01
+warmup_steps: 200
+evaluation_strategy: steps
+eval_steps: 200
+save_strategy: steps
+save_steps: 200
+save_total_limit: 3
+logging_steps: 50
+report_to: none
+
+# LoRA/QLoRA
+loraplus_lr_ratio: 1.0
+lora_target: "[q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,mm_projector]"
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+use_qlora: true
+bnb_4bit_quant_type: nf4
+bnb_4bit_compute_dtype: bfloat16
+bnb_4bit_use_double_quant: true
+
+# 多模态细节
+# 显存紧张时，可限定最大图像短边；默认 Qwen2.5-VL 动态分辨率，无需你手写 grid。
+image_resolution: 0              # 0 表示按模型/模板策略自适应
+lazy_preprocess: true            # 多模态懒加载（官方说明已采用），更省内存。
