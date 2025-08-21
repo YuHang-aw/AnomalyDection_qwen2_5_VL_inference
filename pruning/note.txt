@@ -9,3 +9,41 @@ identity has no attribute encoder
 
 关于 D-FINE 的整体架构
 → 官方代码与文档明确其建立在 RT-DETR 之上（backbone + encoder/decoder + heads），因此把剪枝范围限制在 backbone 卷积是稳妥策略。
+
+
+要再给 count_ops_and_params 传 forward_fn；用上面的 BackboneOnly(pruned_model) 包装器统计就行。
+先 .to(device) 再做 FrozenBN→BN（上面的实现也会把新 BN 放到原层同一 device/dtype）。
+MetaPruner 的构图阶段 AutoGrad 必须开启（不要包 torch.no_grad()）。
+评估时一定传完整模型，别把 module 换成 module.backbone。
+按这个改，你的两个问题都会一起解决：
+
+count_ops_and_params 的 forward_fn 报错消失；
+BN 设备不一致引发的 expected all tensors to be on the same device 也会消失。
+
+
+你这个报错的根因已经很清楚了：剪完之后，某个下游 Conv2d 是分组卷积（groups>1 或 depthwise），而它的 in_channels 不再能被 groups 整除，所以在前向时报：
+
+expected in_channels to be divisible by groups（你看到的“kernel_channels”其实就是 groups 的意思）
+
+这通常发生在我们把分组卷积层加入了 ignored_layers，导致它的 in_channels 没法被联动裁剪；同时又对它的上游输出通道做了裁剪，于是形状被破坏。解决思路有两条要同时做：
+
+不要把分组卷积（含 depthwise）放进 ignored_layers，让它们可以作为依赖层被联动裁掉 in_channels。
+全局对齐倍数 round_to 必须包含所有分组因子（以及 PixelShuffle 的 r^2），确保每次裁掉后的通道数仍是这些分组因子的公倍数，从而天然满足 “in_channels % groups == 0”。
+另外你之前的 FrozenBN→BN 确认了一点：新建的 BN 要放到原层相同的 device/dtype，否则会触发 “expected all tensors to be on the same device”。我把这一点也保留在补丁里。
+
+下面是你需要改的关键代码（放在 DetSolver 里你自己的 val_prune 版本即可；不改模型定义、不改训练流程；保留 need_json 透传）：
+
+
+
+看起来现在出现了两个现象：
+
+评估时报过一次「in_channels 不能被 groups（你日志里写成 kernel_channels）整除」。
+改完后虽然不再崩，但几乎没有剪到（base/pruned 一样）。
+这两个是同一条链上的问题：之前因为把分组卷积（含 depthwise）放进了 ignored_layers，上游被剪了，下游分组卷积的 in_channels 没被联动裁，才会整除失败；把它们“完全忽略”能避免崩溃，但也会大幅降低可剪空间（甚至 0）。正确做法是：
+
+允许分组/深度可分离卷积参与联动剪（不要放进 ignored）。
+把全局 round 对齐放宽（不要用很大的 LCM，否则有效剪裁步长太大，很多层达不到目标比例 → 实际剪 0）。
+确认确实有层被判为“可剪”，否则 pruner 会做空操作。
+下面是一份“关键修改代码”，只改你 DetSolver 里的 val_prune（或在 val 里加开关），其它训练逻辑不动；evaluate 也按你现有签名调用（我给了两种兼容写法）。这份代码同时解决“设备一致”“FrozenBN→BN”“只剪 backbone.Conv2d”“真正发生剪枝”四件事。
+
+
