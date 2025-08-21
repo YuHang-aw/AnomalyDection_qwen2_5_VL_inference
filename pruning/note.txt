@@ -46,4 +46,17 @@ expected in_channels to be divisible by groups（你看到的“kernel_channels�
 确认确实有层被判为“可剪”，否则 pruner 会做空操作。
 下面是一份“关键修改代码”，只改你 DetSolver 里的 val_prune（或在 val 里加开关），其它训练逻辑不动；evaluate 也按你现有签名调用（我给了两种兼容写法）。这份代码同时解决“设备一致”“FrozenBN→BN”“只剪 backbone.Conv2d”“真正发生剪枝”四件事。
 
+确诊了：你现在崩在分组卷积/深度可分离卷积链路——上游被裁完后，下游 Conv2d(groups>1) 的 in_channels 不能整除 groups。
+与其“拍个全局 round_to=9/16/…”，不如做自适应的按依赖对齐：对每个要裁的卷积，先看“它影响到的下游里有哪些分组因子”，然后把本层要裁掉的通道数自动收敛到这些分组因子的最小公倍数，实在不行就逐步回退直到可执行为止。
 
+下面给你一份可以直接塞进 DetSolver 里的“安全裁剪版 val_prune”。要点：
+
+FrozenBN→BN 时，新 BN 放到原层同 device/dtype，避免 device 冲突。
+只传一个 4D CUDA dummy（B×3×H×W），用 forward_fn 让依赖图只跑 backbone(x)，构图不会再拆 65 个奇怪输入。
+不再用 MetaPruner 的统一比例一步到位，而是用 DependencyGraph + 手工选通道 + 计划执行：
+每个候选卷积（backbone 里，groups==1 的“产出层”）先算想裁掉的数量 want；
+通过“预计划(plan)”找出会联动到的所有下游分组卷积，取它们的 groups 的 LCM = M_local；
+把 want 收敛到 floor(want / M_local) * M_local，确保一上来就满足可整除；
+真的还崩，就进入 try→回退到更小的安全倍数 的循环，直到能执行或放弃本层；
+统计 MAC/参数用一个 BackboneOnly 包装器，避免你当前 tp 版本不支持 forward_fn= 的问题。
+评估环节仍然传完整模型（别把 module 变成 module.backbone），你没有的那些 epoch/use_wandb/output_dir 我也做了签名兼容。
