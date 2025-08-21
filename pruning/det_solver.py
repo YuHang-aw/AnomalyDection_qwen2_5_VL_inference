@@ -1,12 +1,10 @@
-# ===== FrozenBN -> BN（保证 device/dtype 一致）=====
-import torch, copy
+import torch
 import torch.nn as nn
-import torch_pruning as tp
 
 try:
     from torchvision.ops.misc import FrozenBatchNorm2d
 except Exception:
-    class FrozenBatchNorm2d(nn.Module): pass
+    class FrozenBatchNorm2d(nn.Module): pass  # 兜底
 
 def _module_device_dtype(m: nn.Module):
     for t in list(m.parameters()) + list(m.buffers()):
@@ -15,6 +13,9 @@ def _module_device_dtype(m: nn.Module):
 
 @torch.no_grad()
 def convert_frozen_bn_to_bn(module: nn.Module):
+    """
+    递归把 FrozenBatchNorm2d 换成 BatchNorm2d，并把“新 BN”放到旧层相同的 device/dtype。
+    """
     for name, child in list(module.named_children()):
         if isinstance(child, FrozenBatchNorm2d):
             dev, dtype = _module_device_dtype(child)
@@ -23,40 +24,71 @@ def convert_frozen_bn_to_bn(module: nn.Module):
                 eps=getattr(child, "eps", 1e-5),
                 momentum=0.1, affine=True, track_running_stats=True
             ).to(device=dev, dtype=dtype)
+
             for dst, src in [("weight","weight"),("bias","bias"),
                              ("running_mean","running_mean"),("running_var","running_var")]:
                 if hasattr(child, src) and hasattr(bn, dst):
                     getattr(bn, dst).data.copy_(getattr(child, src).data.to(device=dev, dtype=dtype))
-            if hasattr(bn, "num_batches_tracked"): bn.num_batches_tracked.zero_()
+
+            if hasattr(bn, "num_batches_tracked"):
+                bn.num_batches_tracked.zero_()
             bn.eval()
             setattr(module, name, bn)
         else:
             convert_frozen_bn_to_bn(child)
 
-# ===== 只允许剪 backbone 的普通 Conv2d =====
+
+
+import math
+
 def _is_depthwise(m: nn.Conv2d):
     return isinstance(m, nn.Conv2d) and m.groups == m.in_channels == m.out_channels
 
-def collect_ignored_layers_only_keep_backbone_convs(full: nn.Module):
+def lcm(a, b): return abs(a*b) // math.gcd(a, b) if a and b else max(a, b)
+
+def detect_align_multiple(model: nn.Module, base_round=8):
+    """
+    返回一个“全局对齐倍数”，保证通道数永远是：
+      L = lcm( base_round, 所有 Conv2d.groups(>1), 所有 PixelShuffle(r)^2 )
+    """
+    L = base_round
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d) and m.groups > 1:
+            L = lcm(L, m.groups)
+        if isinstance(m, nn.PixelShuffle):
+            L = lcm(L, m.upscale_factor * m.upscale_factor)
+    return max(L, 1)
+
+def collect_ignored_layers_keep_backbone_convs(full: nn.Module):
+    """
+    允许：backbone 里的 Conv2d（包括分组/深度可分离）被联动裁剪
+    忽略：检测头/transformer/cls/bbox 等，以及 out=1/3 的输出卷积
+    —— 注意：不再因为 groups>1 就忽略。让依赖修复能触达这些层。
+    """
     allowed = set()
     if hasattr(full, "backbone"):
         for m in full.backbone.modules():
-            if isinstance(m, nn.Conv2d) and m.groups == 1 and not _is_depthwise(m) and m.out_channels not in (1,3):
+            if isinstance(m, nn.Conv2d):
                 allowed.add(m)
+
     ignored = []
-    for m in full.modules():
-        if isinstance(m, nn.Conv2d) and m not in allowed:
-            ignored.append(m)
+    ban_keywords = ("transformer", "encoder", "decoder", "attn", "attention",
+                    "head", "bbox", "cls", "query", "dn", "matcher", "postprocessor")
+    for name, m in full.named_modules():
+        if isinstance(m, nn.Conv2d):
+            low = name.lower()
+            if (m.out_channels in (1, 3)) or any(k in low for k in ban_keywords):
+                if m not in ignored:
+                    ignored.append(m)
+    # 注意：不要把 groups>1 的 conv 放进 ignored！
     return ignored
 
-def round_to_from_model(model: nn.Module, base_round=8):
-    r2 = 1
-    for m in model.modules():
-        if isinstance(m, nn.PixelShuffle):
-            r2 = max(r2, m.upscale_factor*m.upscale_factor)
-    return max(base_round, r2)
 
-# ===== 仅用于统计的包装器：只跑 backbone =====
+import copy
+import torch
+import torch.nn as nn
+import torch_pruning as tp
+
 class BackboneOnly(nn.Module):
     def __init__(self, full):
         super().__init__()
@@ -64,53 +96,57 @@ class BackboneOnly(nn.Module):
     def forward(self, x):
         return self.full.backbone(x)
 
-# ===== DetSolver 内的 val_prune（或在 val 里加开关）=====
 def val_prune(self, need_json=False):
     self.eval()
     device = self.device
     full = self.ema.module if self.ema else self.model
 
-    # 深拷贝完整模型 → 先放到 CUDA，再转换 BN，防止设备不一致
+    # 深拷贝“完整模型”并放到 CUDA
     pruned_model = copy.deepcopy(full).to(device).eval()
+
+    # 仅转换 backbone 里的 FrozenBN（保持 device/dtype）
     if hasattr(pruned_model, "backbone"):
         convert_frozen_bn_to_bn(pruned_model.backbone)
 
-    # 构造 4D CUDA dummy（只用于构图/剪枝）
+    # 构造 4D CUDA dummy（只给 backbone 用；不需要 labels）
     H, W = getattr(self.cfg, "val_input_size", (640, 640))
     example_inputs = torch.randn(1, 3, H, W, device=device).float()
 
-    # 只剪 backbone.Conv2d
-    ignored_layers = collect_ignored_layers_only_keep_backbone_convs(pruned_model)
-    round_to = round_to_from_model(pruned_model, base_round=getattr(self.cfg, "val_prune_round_to", 8))
-    pruning_ratio = getattr(self.cfg, "val_prune_ratio", 0.30)
+    # 只忽略检测头/Transformer 等；允许分组卷积被联动裁剪
+    ignored_layers = collect_ignored_layers_keep_backbone_convs(pruned_model)
 
-    # 重要性
+    # 全局对齐倍数：包含所有 groups 与 PixelShuffle 约束
+    round_to = detect_align_multiple(
+        pruned_model,
+        base_round=getattr(self.cfg, "val_prune_round_to", 8)
+    )
+
+    pruning_ratio = getattr(self.cfg, "val_prune_ratio", 0.30)
     imp = tp.importance.GroupMagnitudeImportance(p=2)
 
-    # 让 MetaPruner 的构图只跑 backbone(x)
+    # 让 pruner 在构图阶段只跑 backbone(x)，但“建图对象”仍是完整模型（这样 encoder/decoder 属性健在）
     def forward_fn_runs_backbone(m: nn.Module, x: torch.Tensor):
         return m.backbone(x)
 
-    # 用 float 做构图更稳（避免 AMP 干扰）
-    pruned_model.float()
-
+    pruned_model.float()  # 构图用 fp32 更稳
     pruner = tp.pruner.MetaPruner(
-        pruned_model,                       # 传完整模型
+        pruned_model,                       # 传完整模型！
         example_inputs=example_inputs,
         importance=imp,
         pruning_ratio=pruning_ratio,
-        ignored_layers=ignored_layers,
-        global_pruning=True, isomorphic=True,
-        round_to=round_to,
+        ignored_layers=ignored_layers,      # 只忽略头/transformer/out=1/3
+        global_pruning=True,
+        isomorphic=True,
+        round_to=round_to,                  # 关键：含所有分组因子
         forward_fn=forward_fn_runs_backbone,
     )
 
-    # —— 统计前后 MAC/Params（不再传 forward_fn；用包装器）——
+    # （你的 tp 版本不支持 forward_fn 参数统计）——用包装器来统计 backbone 的 MAC/参数
     backbone_view = BackboneOnly(pruned_model).to(device).eval().float()
     base_macs, base_params = tp.utils.count_ops_and_params(backbone_view, example_inputs)
     print(f"[VAL-PRUNE][BASE] {base_macs/1e9:.3f}G MACs, {base_params/1e6:.3f}M params")
 
-    pruner.step()   # 注意：不要包 no_grad
+    pruner.step()  # ★ 不要包 no_grad
 
     macs, params = tp.utils.count_ops_and_params(backbone_view, example_inputs)
     print(f"[VAL-PRUNE][PRUNED] {macs/1e9:.3f}G ({macs/base_macs:.3f}x), {params/1e6:.3f}M")

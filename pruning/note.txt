@@ -1,0 +1,11 @@
+expected all tensors to be on the same device
+→ 现在在 FrozenBN→BN 时，新 BN 会被 .to(old_device, old_dtype)。另外，整个 pruned_model 和 example_inputs 都在 self.device 上，且 强制 float() 以避开构图阶段的 AMP 影响。
+
+example_inputs 被拆成很多块 / 仍然不匹配
+→ 通过 forward_fn= 显式告诉 pruner：构图只走 m.backbone(x)，因此 example_inputs 就是一个 4D CUDA Tensor，不再携带 labels/targets。
+
+identity has no attribute encoder
+→ 我们**始终传“完整模型”**给 pruner 和 evaluate，只是把“可剪的层”限制在 backbone.Conv2d；所以外层的 .encoder/.decoder 属性不会丢。
+
+关于 D-FINE 的整体架构
+→ 官方代码与文档明确其建立在 RT-DETR 之上（backbone + encoder/decoder + heads），因此把剪枝范围限制在 backbone 卷积是稳妥策略。
